@@ -1,6 +1,9 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
 # PD2-Vibra-Web
 =======
+=======
+>>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
 # VIBRA — Room analysis web app
 
 Machine Learning-Based Reverberation Classification System for Spatial
@@ -57,4 +60,7 @@ The RT60 card shows `rt60.source` ("MEASURED"). If RT60 is predicted
 with Sabine/Eyring rather than captured from an interrupted-noise decay,
 change it to "ESTIMATED" and cite EN 12354-6, not ISO 3382-2. The label
 lives in one place: `config.js` (sample) or `useRoomData.jsx` (sheet).
+<<<<<<< HEAD
 >>>>>>> 29fa358 (Initial commit)
+=======
+>>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
