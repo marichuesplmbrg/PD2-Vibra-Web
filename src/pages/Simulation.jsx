@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import * as THREE from "three";
-<<<<<<< HEAD
 import { Play, Pause, RotateCw, Radio, Target, TrendingDown, TrendingUp, CheckCircle2, Volume2 } from "lucide-react";
 import { vibraHistory } from "./vibraHistory";
 import { PROTOTYPE_STL_BASE64 } from "./prototypeModel";
@@ -41,22 +40,6 @@ function makeLabel(text, { fg = "#e9eaf0", worldH = 0.34 } = {}) {
 }
 
 
-=======
-import { Play, Pause, RotateCw, Radio } from "lucide-react";
-import { vibraHistory } from "./vibraHistory";
-
-/* Theme */
-const C = {
-  bg: "#0a0e1a", panel: "#141a2c", panelAlt: "#111627", card: "#171d30",
-  border: "#242c43", borderSoft: "#1d2438",
-  text: "#f3f5fb", textDim: "#8b93a8", textFaint: "#5d6479",
-  orange: "#f6a24b", purple: "#9b7ff0", green: "#5cd6a0",
-  hot: "#f2686e", dead: "#5aa9f6",
-};
-const GRAD = "linear-gradient(135deg, #f6a24b 0%, #9b7ff0 100%)";
-const numish = (v) => v !== "" && v != null && !isNaN(parseFloat(v)) && isFinite(v);
-
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
 // Where the prototype STL is served from. Put prototype.stl in your app's
 // /public/models/ folder, or pass a `deviceUrl` prop to override.
 const DEVICE_URL = "/models/prototype.stl";
@@ -73,7 +56,6 @@ function parseSTL(buffer) {
   return parseAsciiSTL(buffer);
 }
 function parseBinarySTL(dv, n) {
-<<<<<<< HEAD
   const pos = new Float32Array(n * 9);
   let off = 84;
   for (let i = 0; i < n; i++) {
@@ -81,28 +63,13 @@ function parseBinarySTL(dv, n) {
     for (let v = 0; v < 3; v++) {
       const idx = (i * 3 + v) * 3;
       pos[idx] = dv.getFloat32(off, true); pos[idx + 1] = dv.getFloat32(off + 4, true); pos[idx + 2] = dv.getFloat32(off + 8, true);
-=======
-  const pos = new Float32Array(n * 9), nor = new Float32Array(n * 9);
-  let off = 84;
-  for (let i = 0; i < n; i++) {
-    const nx = dv.getFloat32(off, true), ny = dv.getFloat32(off + 4, true), nz = dv.getFloat32(off + 8, true);
-    off += 12;
-    for (let v = 0; v < 3; v++) {
-      const idx = (i * 3 + v) * 3;
-      pos[idx] = dv.getFloat32(off, true); pos[idx + 1] = dv.getFloat32(off + 4, true); pos[idx + 2] = dv.getFloat32(off + 8, true);
-      nor[idx] = nx; nor[idx + 1] = ny; nor[idx + 2] = nz;
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
       off += 12;
     }
     off += 2;
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-<<<<<<< HEAD
   g.computeVertexNormals(); // derive clean normals so the mesh isn't shaded flat-black
-=======
-  g.setAttribute("normal", new THREE.BufferAttribute(nor, 3));
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
   return g;
 }
 function parseAsciiSTL(buffer) {
@@ -125,7 +92,6 @@ function prepareDevice(geo) {
   return geo;
 }
 
-<<<<<<< HEAD
 // Decode a base64 string to an ArrayBuffer (for the embedded fallback model).
 function b64ToArrayBuffer(b64) {
   const bin = atob(b64);
@@ -152,8 +118,6 @@ function safeParseDevice(buf) {
   }
 }
 
-=======
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
 /* ------------------------------------------------------------------ *
  * Parse the deployed bundle into geometry the scene can draw.
  * - room: {w,l,h} in metres (from the Room/dimensions tab)
@@ -194,10 +158,6 @@ function parseDeployment(dep) {
 
   // --- hot / dead spots (classification / reverberation) ---
   let spots = [];
-<<<<<<< HEAD
-=======
-  let sample = false;
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
   for (const [, t] of Object.entries(tabs)) {
     const cols = t.columns || [];
     const xi = colIdx(cols, /x/i), yi = colIdx(cols, /y/i);
@@ -229,7 +189,6 @@ function parseDeployment(dep) {
   if (room.w && room.l) fitInside(spots, room.w, room.l, "contain", 0.8);
   else centre(spots);
 
-<<<<<<< HEAD
   // average RT60 from a reverberation-style tab, if present
   let rt60 = null;
   for (const [, t] of Object.entries(tabs)) {
@@ -242,22 +201,6 @@ function parseDeployment(dep) {
   }
 
   return { room, rawPoints, spots, rt60, roomTs: dep.roomTs, at: dep.at };
-=======
-  // Fallback so the concept is visible when the acoustic tabs don't carry
-  // usable positions yet. Clearly flagged as sample data in the UI.
-  if (!spots.length && room.w && room.l) {
-    sample = true;
-    const gx = 3, gz = 3;
-    for (let i = 0; i < gx; i++) for (let j = 0; j < gz; j++) {
-      const x = (i / (gx - 1) - 0.5) * room.w * 0.7;
-      const z = (j / (gz - 1) - 0.5) * room.l * 0.7;
-      const corner = (i === 0 || i === gx - 1) && (j === 0 || j === gz - 1);
-      spots.push({ x, z, type: corner ? "hot" : "dead", value: null });
-    }
-  }
-
-  return { room, rawPoints, spots, sample, roomTs: dep.roomTs, at: dep.at };
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
 }
 
 function centre(pts) {
@@ -283,11 +226,7 @@ function fitInside(pts, w, l, mode, inset = 0.95) {
 }
 
 /* ================================================================== */
-<<<<<<< HEAD
 export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
-=======
-export default function SimulationPage({ deviceUrl } = {}) {
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
   const [dep, setDep] = useState(() => vibraHistory.getDeployment());
   const [orbiting, setOrbiting] = useState(true);
   const [layers, setLayers] = useState({ shell: true, edges: true, raw: true, spots: true, omni: true, device: true });
@@ -298,7 +237,6 @@ export default function SimulationPage({ deviceUrl } = {}) {
 
   useEffect(() => vibraHistory.onDeploy(setDep), []);
 
-<<<<<<< HEAD
   // Load the prototype model. Try to fetch a served STL first (so you can swap
   // the file without a rebuild); if none is reachable — or the server returns an
   // HTML SPA-fallback with 200 — fall back to the model bundled with the app so
@@ -337,16 +275,6 @@ export default function SimulationPage({ deviceUrl } = {}) {
       setDeviceStatus("error");
       console.warn("[VIBRA] Prototype model not loaded. Tried:\n  " + tried.join("\n  "));
     })();
-=======
-  // load the prototype STL once
-  useEffect(() => {
-    let alive = true;
-    setDeviceStatus("loading");
-    fetch(deviceHref)
-      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); })
-      .then((buf) => { if (!alive) return; setDeviceGeo(prepareDevice(parseSTL(buf))); setDeviceStatus("ready"); })
-      .catch((err) => { if (!alive) return; setDeviceStatus("error"); console.warn(`[VIBRA] Prototype STL not loaded from "${deviceHref}":`, err.message); });
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
     return () => { alive = false; };
   }, [deviceHref]);
 
@@ -458,10 +386,7 @@ export default function SimulationPage({ deviceUrl } = {}) {
 
     const { w, l } = model.room;
     const h = model.room.h || 2.6;
-<<<<<<< HEAD
     const COL = { edge: cssVar("--orange", "#f6a15c"), raw: cssVar("--violet", "#a98bf5"), hot: cssVar("--bad", "#ff5b52"), dead: cssVar("--sim-dead", "#5b9dff"), cyan: cssVar("--cyan", "#62d0e0"), device: cssVar("--device", "#c2cae0") };
-=======
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
 
     // room shell (fit) — wire box + faint floor
     const shell = new THREE.Group();
@@ -471,7 +396,6 @@ export default function SimulationPage({ deviceUrl } = {}) {
     shell.add(edges);
     const floor = new THREE.Mesh(new THREE.PlaneGeometry(w, l), new THREE.MeshBasicMaterial({ color: 0x141b30, transparent: true, opacity: 0.55, side: THREE.DoubleSide }));
     floor.rotation.x = -Math.PI / 2; floor.position.y = 0.001; shell.add(floor);
-<<<<<<< HEAD
 
     // full-floor grid — large 1 m cells, effectively limitless: the extent sits
     // far beyond the camera's max zoom, so no edge is ever visible.
@@ -540,8 +464,6 @@ export default function SimulationPage({ deviceUrl } = {}) {
     addLabel(makeLabel("S 180°", cardStyle), 0, cy, l / 2 + cOff);
     addLabel(makeLabel("W 270°", cardStyle), -w / 2 - cOff, cy, 0);
 
-=======
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
     content.add(shell); groups.shell = shell;
 
     // detected edges — footprint rectangle on the floor
@@ -550,11 +472,7 @@ export default function SimulationPage({ deviceUrl } = {}) {
       new THREE.Vector3(w / 2, 0.02, l / 2), new THREE.Vector3(-w / 2, 0.02, l / 2),
       new THREE.Vector3(-w / 2, 0.02, -l / 2),
     ];
-<<<<<<< HEAD
     const rect = new THREE.Line(new THREE.BufferGeometry().setFromPoints(rectPts), new THREE.LineBasicMaterial({ color: COL.edge, transparent: true, opacity: 0.9 }));
-=======
-    const rect = new THREE.Line(new THREE.BufferGeometry().setFromPoints(rectPts), new THREE.LineBasicMaterial({ color: 0xf6a24b, transparent: true, opacity: 0.9 }));
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
     content.add(rect); groups.edges = rect;
 
     // raw points
@@ -563,11 +481,7 @@ export default function SimulationPage({ deviceUrl } = {}) {
       const arr = new Float32Array(model.rawPoints.length * 3);
       model.rawPoints.forEach((p, i) => { arr[i * 3] = p.x; arr[i * 3 + 1] = 0.03; arr[i * 3 + 2] = p.z; });
       g.setAttribute("position", new THREE.BufferAttribute(arr, 3));
-<<<<<<< HEAD
       const pts = new THREE.Points(g, new THREE.PointsMaterial({ color: COL.raw, size: 0.06, sizeAttenuation: true, transparent: true, opacity: 0.85 }));
-=======
-      const pts = new THREE.Points(g, new THREE.PointsMaterial({ color: 0x9b7ff0, size: 0.06, sizeAttenuation: true, transparent: true, opacity: 0.85 }));
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
       content.add(pts); groups.raw = pts;
     }
 
@@ -577,11 +491,7 @@ export default function SimulationPage({ deviceUrl } = {}) {
       const spotGroup = new THREE.Group();
       const y = Math.min(1.2, h * 0.5);
       model.spots.forEach((s) => {
-<<<<<<< HEAD
         const col = s.type === "hot" ? COL.hot : COL.dead;
-=======
-        const col = s.type === "hot" ? 0xf2686e : 0x5aa9f6;
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
         const info = { type: s.type, value: s.value, x: s.x, z: s.z };
         const core = new THREE.Mesh(new THREE.SphereGeometry(0.13, 20, 16), new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.6, roughness: 0.4 }));
         core.position.set(s.x, y, s.z); core.userData = info;
@@ -596,7 +506,6 @@ export default function SimulationPage({ deviceUrl } = {}) {
     }
     spotsRef.current = pick;
 
-<<<<<<< HEAD
     // omnidirectional sensor field — sound is detected equally in every direction.
     // The field is centred in the room and scaled to its physical dimensions: the
     // outer shell reaches close to the nearest surface (wall / floor / ceiling).
@@ -606,17 +515,6 @@ export default function SimulationPage({ deviceUrl } = {}) {
       const y = h / 2;                                   // centre of the room height
       const maxR = Math.min(w / 2, l / 2, h / 2) * 0.95; // limited by the nearest surface
       const nodeR = Math.max(0.05, maxR * 0.12);
-=======
-    // omnidirectional sensor field — sound is detected equally in every direction
-    {
-      const omni = new THREE.Group();
-      const y = Math.min(1.4, h * 0.45);
-      const cyan = 0x62d0e0;
-      // size the field to the room: the outer shell reaches close to the
-      // nearest surface (wall / floor / ceiling) without spilling outside.
-      const maxR = Math.max(0.4, Math.min(w / 2, l / 2, y, h - y) * 0.92);
-      const nodeR = Math.max(0.1, Math.min(0.24, maxR * 0.12));
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
       const node = new THREE.Mesh(new THREE.SphereGeometry(nodeR, 20, 16), new THREE.MeshStandardMaterial({ color: cyan, emissive: cyan, emissiveIntensity: 0.7, roughness: 0.3 }));
       node.position.set(0, y, 0); omni.add(node);
       [0.42, 0.7, 1.0].forEach((f, i) => {
@@ -630,7 +528,6 @@ export default function SimulationPage({ deviceUrl } = {}) {
 
     // prototype device — fixed at the room centre on the floor
     if (deviceGeo) {
-<<<<<<< HEAD
       const geo = deviceGeo.clone();
       geo.computeBoundingBox();
       const bb = geo.boundingBox;
@@ -666,19 +563,6 @@ export default function SimulationPage({ deviceUrl } = {}) {
     const fov = ((T.camera && T.camera.fov) || 46) * Math.PI / 180;
     const sphere = Math.hypot(w, h, l) / 2;        // room bounding-sphere radius
     orb.radius = (sphere / Math.tan(fov / 2)) * 1.25; // 1.25 = small margin for labels
-=======
-      const mat = new THREE.MeshStandardMaterial({ color: 0xc2cae0, metalness: 0.25, roughness: 0.55 });
-      const mesh = new THREE.Mesh(deviceGeo.clone(), mat);
-      mesh.position.set(0, 0, 0);
-      const g = new THREE.Group(); g.add(mesh);
-      content.add(g); groups.device = g;
-    }
-
-    // frame the camera to the room
-    const orb = orbit.current;
-    orb.target.set(0, h / 2, 0);
-    orb.radius = Math.max(w, l, h) * 1.7 + 3;
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
 
     applyLayers(groups, layers);
   }, [model, deviceGeo]);
@@ -693,7 +577,6 @@ export default function SimulationPage({ deviceUrl } = {}) {
     return { hot: model.spots.filter((s) => s.type === "hot").length, dead: model.spots.filter((s) => s.type === "dead").length };
   }, [model]);
 
-<<<<<<< HEAD
   /* canvas-only mode (embedded in the Dashboard's Room twin) — the SAME live
      scene, without the page header / layers panel / recommendations. */
   if (twinOnly) {
@@ -787,100 +670,12 @@ export default function SimulationPage({ deviceUrl } = {}) {
           </div>
           {hover.value != null && numish(hover.value) && <div className="ln">Level {Number(hover.value).toLocaleString(undefined, { maximumFractionDigits: 3 })}</div>}
           <div className="ln faint">x {hover.x.toFixed(2)} m · z {hover.z.toFixed(2)} m</div>
-=======
-  return (
-    <div style={{ background: C.bg, color: C.text, fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif", minHeight: "100%" }}>
-      <main style={{ padding: "26px 34px 40px", maxWidth: 1240 }}>
-        <h1 style={{ fontSize: 30, fontWeight: 800, margin: "0 0 4px", letterSpacing: -0.4 }}>Simulation</h1>
-        <p style={{ color: C.textDim, margin: "0 0 20px", fontSize: 15 }}>
-          {hasModel ? `Live scan · room shell + acoustic hot / dead spots${model.roomTs ? ` · ${model.roomTs}` : ""}` : "Deploy a room scan from the Parameters table to build the twin"}
-        </p>
-
-        <div style={{ display: "flex", gap: 22, alignItems: "stretch", flexWrap: "wrap" }}>
-          {/* 3D box */}
-          <section style={{ ...panel, flex: "1 1 620px", minWidth: 0, display: "flex", flexDirection: "column", height: "clamp(420px, calc(100dvh - 240px), 760px)" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "16px 18px", borderBottom: `1px solid ${C.borderSoft}`, flexWrap: "wrap" }}>
-              <div style={{ marginRight: "auto" }}>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>Live scan</div>
-                <div style={{ fontSize: 13, color: C.textDim }}>Combined twin</div>
-              </div>
-              {/* legend */}
-              <div style={{ display: "flex", alignItems: "center", gap: 14, fontSize: 12.5, color: C.textDim }}>
-                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><Dot c={C.hot} /> Hotspot</span>
-                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><Dot c={C.dead} /> Deadspot</span>
-              </div>
-              {/* start / pause orbit */}
-              <button style={{ ...btn, ...(orbiting ? {} : { background: GRAD, color: "#241706", borderColor: "transparent" }) }} onClick={() => setOrbiting((v) => !v)}>
-                {orbiting ? <><Pause size={15} color={C.text} /> Pause</> : <><Play size={15} color="#241706" /> Start</>}
-              </button>
-            </div>
-
-            <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
-              <div ref={mountRef} style={{ position: "absolute", inset: 0 }} />
-              {!hasModel && (
-                <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, color: C.textDim, textAlign: "center", padding: 24 }}>
-                  <Radio size={26} color={C.textFaint} />
-                  <div style={{ fontSize: 15 }}>Nothing deployed yet.</div>
-                  <div style={{ fontSize: 13.5 }}>Open the Parameters table, pick a room scan, and press <b style={{ color: C.text, fontWeight: 600 }}>Deploy to Simulation</b>.</div>
-                </div>
-              )}
-              {hasModel && (
-                <div style={{ position: "absolute", right: 14, bottom: 12, fontSize: 12, color: C.textFaint }}>drag to orbit · scroll to zoom</div>
-              )}
-            </div>
-          </section>
-
-          {/* Layers */}
-          <section style={{ ...panel, flex: "1 1 300px", minWidth: 260 }}>
-            <div style={{ padding: "16px 18px 8px" }}>
-              <div style={{ fontSize: 16, fontWeight: 700 }}>Layers</div>
-              <div style={{ fontSize: 13, color: C.textDim }}>Toggle what's drawn</div>
-            </div>
-            <div style={{ padding: "6px 12px 12px" }}>
-              <LayerRow color={0x8a93c9} label="Room shell (fit)" on={layers.shell} onClick={() => toggle("shell")} disabled={!hasModel} />
-              <LayerRow color={0xf6a24b} label="Detected edges" on={layers.edges} onClick={() => toggle("edges")} disabled={!hasModel} />
-              <LayerRow color={0x9b7ff0} label={`Raw points${model?.rawPoints?.length ? ` (${model.rawPoints.length})` : ""}`} on={layers.raw} onClick={() => toggle("raw")} disabled={!hasModel || !model?.rawPoints?.length} />
-              <LayerRow color={0xf2686e} label={`Hot / dead spots${model?.spots?.length ? ` (${counts.hot}/${counts.dead})` : ""}`} on={layers.spots} onClick={() => toggle("spots")} disabled={!hasModel || !model?.spots?.length} />
-              <LayerRow color={0x62d0e0} label="Omnidirectional sensor" on={layers.omni} onClick={() => toggle("omni")} disabled={!hasModel} />
-              <LayerRow color={0xc2cae0}
-                label={deviceStatus === "error" ? "Prototype — file not found" : deviceStatus === "loading" ? "Prototype — loading…" : "Prototype (device)"}
-                on={layers.device} onClick={() => toggle("device")} disabled={!hasModel || !deviceGeo} />
-            </div>
-            <div style={{ padding: "8px 18px 18px", fontSize: 13, color: C.textDim, lineHeight: 1.55, borderTop: `1px solid ${C.borderSoft}` }}>
-              The raw points and detected edges sit inside the clean rectangle shell, so you can see how closely the fit matches the real walls. Red marks reverberant hotspots, blue marks dead spots, and the cyan node shows the omnidirectional sensor that reads sound equally in every direction. Hover a spot for its details.
-              {model?.sample && (
-                <div style={{ marginTop: 10, color: C.orange, fontSize: 12.5 }}>
-                  Showing sample spot positions — the deployed acoustic tab didn't include per-point coordinates. Add x/y columns (and a class or RT60 metric) to plot real spots.
-                </div>
-              )}
-              {deviceStatus === "error" && (
-                <div style={{ marginTop: 10, color: C.orange, fontSize: 12.5 }}>
-                  Couldn't load the prototype from “{deviceHref}”. Put <b style={{ color: C.text }}>prototype.stl</b> where that path resolves (e.g. <b style={{ color: C.text }}>public/models/</b>), or pass a <b style={{ color: C.text }}>deviceUrl</b> prop.
-                </div>
-              )}
-            </div>
-          </section>
-        </div>
-      </main>
-
-      {hover && (
-        <div style={{ position: "fixed", left: hover.sx + 14, top: hover.sy + 14, zIndex: 80, pointerEvents: "none", background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "9px 12px", boxShadow: "0 12px 34px rgba(0,0,0,.55)", fontSize: 12.5 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, fontWeight: 700, color: hover.type === "hot" ? C.hot : C.dead }}>
-            <span style={{ width: 9, height: 9, borderRadius: 999, background: hover.type === "hot" ? C.hot : C.dead }} />
-            {hover.type === "hot" ? "Hotspot" : "Deadspot"}
-          </div>
-          {hover.value != null && numish(hover.value) && (
-            <div style={{ color: C.textDim, marginTop: 4 }}>Level {Number(hover.value).toLocaleString(undefined, { maximumFractionDigits: 3 })}</div>
-          )}
-          <div style={{ color: C.textFaint, marginTop: 4 }}>x {hover.x.toFixed(2)} m · z {hover.z.toFixed(2)} m</div>
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
         </div>
       )}
     </div>
   );
 }
 
-<<<<<<< HEAD
 /* ---- recommendations ---- */
 function buildRecs(model, counts) {
   const recs = [];
@@ -941,21 +736,6 @@ function LayerRow({ tone, label, on, onClick, disabled }) {
       <span className={`layer-dot ${tone}`} />
       <span className="layer-name">{label}</span>
     </label>
-=======
-/* ---- small bits ---- */
-function Dot({ c }) { return <span style={{ width: 10, height: 10, borderRadius: 999, background: c, boxShadow: `0 0 8px ${c}` }} />; }
-function LayerRow({ color, label, on, onClick, disabled }) {
-  const hex = "#" + color.toString(16).padStart(6, "0");
-  return (
-    <button onClick={onClick} disabled={disabled}
-      style={{ display: "flex", alignItems: "center", gap: 11, width: "100%", padding: "9px 8px", border: "none", background: "transparent", borderRadius: 9, cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.4 : 1, textAlign: "left" }}>
-      <span style={{ width: 18, height: 18, borderRadius: 5, background: on ? GRAD : "transparent", border: on ? "none" : `1.5px solid ${C.border}`, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-        {on && <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#241706" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6 9 17l-5-5" /></svg>}
-      </span>
-      <span style={{ width: 9, height: 9, borderRadius: 999, background: hex, flexShrink: 0 }} />
-      <span style={{ fontSize: 14, color: C.text }}>{label}</span>
-    </button>
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
   );
 }
 
@@ -975,11 +755,4 @@ function disposeDeep(obj) {
   });
   if (obj.geometry) obj.geometry.dispose?.();
   if (obj.material) { Array.isArray(obj.material) ? obj.material.forEach((m) => m.dispose?.()) : obj.material.dispose?.(); }
-<<<<<<< HEAD
 }
-=======
-}
-
-const panel = { background: C.panel, border: `1px solid ${C.border}`, borderRadius: 16, overflow: "hidden" };
-const btn = { display: "inline-flex", alignItems: "center", gap: 8, padding: "8px 14px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 13.5, fontWeight: 600, cursor: "pointer" };
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d

@@ -124,15 +124,12 @@ html, body, #root { height: 100%; margin: 0; }
 .panel-title { font-size: 17px; font-weight: 700; margin: 0; }
 .panel-sub { font-size: 13px; color: var(--muted); margin: 5px 0 0; }
 
-<<<<<<< HEAD
 .twin { position: relative; min-height: 420px; padding: 20px; display: flex; flex-direction: column; overflow: hidden; }
 .twin-head { position: relative; z-index: 2; }
 .twin-canvas { position: absolute; inset: 0; top: 70px; overflow: hidden; border-radius: 0 0 16px 16px; }
-=======
 .twin { position: relative; min-height: 420px; padding: 20px; display: flex; flex-direction: column; }
 .twin-head { position: relative; z-index: 2; }
 .twin-canvas { position: absolute; inset: 0; top: 70px; }
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
 .legend {
   position: absolute; left: 20px; bottom: 18px; display: flex; gap: 18px;
   z-index: 2; font-size: 12.5px; color: var(--muted);
@@ -227,7 +224,6 @@ html, body, #root { height: 100%; margin: 0; }
 .layer-row input:checked + .layer-box svg { opacity: 1; }
 .layer-row input:focus-visible + .layer-box { outline: 2px solid var(--violet); outline-offset: 2px; }
 .layer-name { font-size: 14.5px; font-weight: 500; }
-<<<<<<< HEAD
 .layer-note { margin: 18px 0 0; font-size: 13.5px; color: var(--muted); line-height: 1.55; }
 /* ============================================================
    VIBRA — shared UI + page styles (Parameters / History / Simulation)
@@ -532,6 +528,4 @@ html, body, #root { height: 100%; margin: 0; }
     grid-template-columns: 1fr;
   }
 }
-=======
 .layer-note { margin: 18px 0 0; font-size: 13.5px; color: var(--muted); line-height: 1.55; }
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d

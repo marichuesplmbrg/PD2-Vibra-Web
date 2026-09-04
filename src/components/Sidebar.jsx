@@ -6,10 +6,7 @@ import {
   Table2,
   History,
   Activity,
-<<<<<<< HEAD
-=======
   Target,
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
   ClipboardList,
   Users,
   Settings2,
@@ -22,10 +19,6 @@ const PRIMARY = [
   { to: "/parameters", label: "Parameters table", icon: Table2 },
   { to: "/history", label: "History", icon: History },
   { to: "/simulation", label: "Simulation", icon: Activity },
-<<<<<<< HEAD
-=======
-  { to: "/recommendations", label: "Recommendations", icon: Target },
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
   { to: "/instructions", label: "Instructions", icon: ClipboardList },
 ];
 
@@ -71,8 +64,5 @@ export default function Sidebar() {
 
     </aside>
   );
-<<<<<<< HEAD
 }
-=======
-}
->>>>>>> 29fa3588035779743d20d612ea07a76684da8d9d
+
