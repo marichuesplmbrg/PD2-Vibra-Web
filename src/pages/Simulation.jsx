@@ -50,6 +50,27 @@ function makeLabel(text, { fg = "#e9eaf0", worldH = 0.34, accent = null } = {}) 
 }
 
 
+/* Soft radial falloff used as the spot glow. One canvas, reused by every
+   marker and tinted per-spot through the sprite material's colour. White so
+   the tint is exact; additive blending makes it read as light, not paint. */
+let _glowTex = null;
+function glowTexture() {
+  if (_glowTex) return _glowTex;
+  const S = 128, c = S / 2;
+  const cv = document.createElement("canvas"); cv.width = cv.height = S;
+  const ctx = cv.getContext("2d");
+  const g = ctx.createRadialGradient(c, c, 0, c, c, c);
+  g.addColorStop(0.00, "rgba(255,255,255,0.50)");
+  g.addColorStop(0.18, "rgba(255,255,255,0.28)");
+  g.addColorStop(0.45, "rgba(255,255,255,0.11)");
+  g.addColorStop(0.72, "rgba(255,255,255,0.035)");
+  g.addColorStop(1.00, "rgba(255,255,255,0)");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, S, S);
+  _glowTex = new THREE.CanvasTexture(cv);
+  _glowTex.minFilter = THREE.LinearFilter;
+  return _glowTex;
+}
+
 // Where the prototype STL is served from. Put prototype.stl in your app's
 // /public/models/ folder, or pass a `deviceUrl` prop to override.
 const DEVICE_URL = "/models/prototype.stl";
@@ -132,10 +153,55 @@ function safeParseDevice(buf) {
  * Parse the deployed bundle into geometry the scene can draw.
  * - room: {w,l,h} in metres (from the Room/dimensions tab)
  * - rawPoints: [{x,z}] from an obstacle/points tab (x/y in mm -> m)
- * - spots: [{x,z,type:'hot'|'dead',value}] from a classification/reverb tab
+ * - spots: [{x,z,type:'hot'|'dead'|'neutral',value}] from a classification tab.
+ *   Rows carrying only a bearing (angle) are ray-cast onto the room walls.
  * Positions are centred on the room so everything lines up.
  * ------------------------------------------------------------------ */
-function colIdx(cols, re) { return cols.findIndex((c) => re.test(c)); }
+function colIdx(cols, re) { return cols.findIndex((c) => re.test(String(c))); }
+
+/* Column matchers. `x`/`y` are anchored — a loose /x/i also matches "max_db",
+   "index" or "x_offset", which is how a Reverberation tab can masquerade as a
+   coordinate table. */
+const RX_X = /^\s*(x|x_m|x_mm|x_pos|pos_x|coord_x|x_coord)\s*$/i;
+const RX_Y = /^\s*(y|y_m|y_mm|y_pos|pos_y|coord_y|y_coord)\s*$/i;
+const RX_CLASS = /class|label|zone|category|status|spot/i;
+const RX_METRIC = /rt60|reverb|spl|level|db|energy|score|intensity/i;
+const RX_ANGLE = /^\s*(angle|bearing|azimuth|heading|deg)/i;
+
+/* Classification is the tab that owns hot/dead/neutral, so it is searched
+   first. Without this ordering the first tab that merely happens to carry
+   coordinates and a level column wins, and the labels get re-derived from a
+   median split instead of read from the sheet. */
+function rankedTabs(tabs) {
+  return Object.entries(tabs || {})
+    .map(([name, t]) => ({
+      name: String(name),
+      cols: t?.columns || [],
+      rows: Array.isArray(t?.rows) ? t.rows : [],
+    }))
+    .filter((e) => e.rows.length && e.cols.length)
+    .map((e) => ({
+      ...e,
+      classI: colIdx(e.cols, RX_CLASS),
+      metricI: colIdx(e.cols, RX_METRIC),
+      angleI: colIdx(e.cols, RX_ANGLE),
+      xi: colIdx(e.cols, RX_X),
+      yi: colIdx(e.cols, RX_Y),
+      named: /class/i.test(String(e.name)),
+    }))
+    .sort((a, b) => (b.named - a.named) || ((b.classI >= 0) - (a.classI >= 0)));
+}
+
+/* "Hot Spot" / "hot_spot" / "HOTSPOT" -> hot;  "Neutral Zone" -> neutral.
+   Normalised first so header casing and separators can't cause a miss. */
+function classifyLabel(raw) {
+  const c = String(raw ?? "").toLowerCase().replace(/[\s_-]/g, "");
+  if (/neutral|balanced|normal|nominal|within|ok/.test(c)) return "neutral";
+  if (/hot|high|live|bright|excess/.test(c)) return "hot";
+  if (/dead|low|dull|null|quiet/.test(c)) return "dead";
+  return "neutral";
+}
+const SPOT_LABEL = { hot: "Hotspot", dead: "Deadspot", neutral: "Neutral zone" };
 
 function parseDeployment(dep) {
   if (!dep) return null;
@@ -175,38 +241,78 @@ function parseDeployment(dep) {
   if (room.w && room.l) fitInside(rawPoints, room.w, room.l, "fill", 0.98);
   else centre(rawPoints);
 
-  // --- hot / dead spots (classification / reverberation) ---
+  // --- hot / dead / neutral spots ---
+  // Labels are read from the Classification tab. A median split is only used
+  // when no tab in the bundle carries a class column at all, and the result is
+  // flagged so the UI can say the labels were derived rather than measured.
   let spots = [];
-  for (const [, t] of Object.entries(tabs)) {
-    const cols = t.columns || [];
-    const xi = colIdx(cols, /x/i), yi = colIdx(cols, /y/i);
-    const classI = colIdx(cols, /class|label|type|status|spot/i);
-    const metricI = colIdx(cols, /rt60|reverb|spl|level|db|energy|score/i);
-    if (xi >= 0 && yi >= 0 && (classI >= 0 || metricI >= 0)) {
-      const mm = /mm/i.test(cols[xi]);
-      const rows = t.rows || [];
-      const metricVals = metricI >= 0 ? rows.map((r) => parseFloat(r[metricI])).filter(numish) : [];
-      const median = metricVals.length ? [...metricVals].sort((a, b) => a - b)[Math.floor(metricVals.length / 2)] : 0;
-      spots = rows.map((r) => {
-        let x = parseFloat(r[xi]), z = parseFloat(r[yi]);
+  let spotsAreBearings = false;
+  let spotsDerived = false;
+  let spotsFrom = null;
+
+  const cands = rankedTabs(tabs);
+  const anyClassTab = cands.some((c) => c.classI >= 0);
+
+  for (const c of cands) {
+    // Once the bundle is known to carry labels, don't accept a tab without them.
+    if (anyClassTab && c.classI < 0) continue;
+
+    const metricVals = c.metricI >= 0 ? c.rows.map((r) => parseFloat(r[c.metricI])).filter(numish) : [];
+    const sorted = [...metricVals].sort((a, b) => a - b);
+    const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
+
+    const readType = (r) => {
+      if (c.classI >= 0) return classifyLabel(r[c.classI]);
+      const v = parseFloat(r[c.metricI]);
+      return numish(v) && v >= median ? "hot" : "dead";
+    };
+    const readValue = (r) =>
+      c.metricI >= 0 && numish(r[c.metricI]) ? parseFloat(r[c.metricI]) : null;
+
+    // Cartesian rows first.
+    if (c.xi >= 0 && c.yi >= 0) {
+      const mm = /mm/i.test(String(c.cols[c.xi]));
+      const out = c.rows.map((r) => {
+        let x = parseFloat(r[c.xi]), z = parseFloat(r[c.yi]);
         if (!numish(x) || !numish(z)) return null;
         if (mm) { x /= 1000; z /= 1000; }
-        let type = "dead", value = null;
-        if (classI >= 0) {
-          const c = String(r[classI]).toLowerCase();
-          type = /hot|high|live|bright/.test(c) ? "hot" : "dead";
-        } else if (metricI >= 0) {
-          value = parseFloat(r[metricI]);
-          type = value >= median ? "hot" : "dead";
-        }
-        return { x, z, type, value };
+        return { x, z, type: readType(r), value: readValue(r) };
       }).filter(Boolean);
-      if (spots.length) break;
+      if (out.length) {
+        spots = out; spotsFrom = c.name; spotsDerived = c.classI < 0;
+        break;
+      }
+    }
+
+    // Bearing-only rows. A bearing is a direction, not a position, so each
+    // reading is ray-cast from room centre onto the wall it points at.
+    if (c.angleI >= 0 && room.w && room.l) {
+      const hx = (room.w / 2) * 0.94, hz = (room.l / 2) * 0.94;
+      const out = c.rows.map((r) => {
+        const deg = parseFloat(r[c.angleI]);
+        if (!numish(deg)) return null;
+        const rad = (deg * Math.PI) / 180;
+        const dx = Math.cos(rad), dz = Math.sin(rad);
+        const tx = Math.abs(dx) < 1e-6 ? Infinity : hx / Math.abs(dx);
+        const tz = Math.abs(dz) < 1e-6 ? Infinity : hz / Math.abs(dz);
+        const tt = Math.min(tx, tz); // first wall the bearing meets
+        if (!isFinite(tt)) return null;
+        return { x: dx * tt, z: dz * tt, type: readType(r), value: readValue(r), angle: deg };
+      }).filter(Boolean);
+      if (out.length) {
+        spots = out; spotsFrom = c.name; spotsDerived = c.classI < 0;
+        spotsAreBearings = true;
+        break;
+      }
     }
   }
-  // keep measurement spots comfortably inside the room footprint
-  if (room.w && room.l) fitInside(spots, room.w, room.l, "contain", 0.8);
-  else centre(spots);
+
+  // keep measurement spots comfortably inside the room footprint. Bearing spots
+  // are already anchored to the walls — rescaling them would destroy the mapping.
+  if (!spotsAreBearings) {
+    if (room.w && room.l) fitInside(spots, room.w, room.l, "contain", 0.8);
+    else centre(spots);
+  }
 
   // average RT60 from a reverberation-style tab, if present
   let rt60 = null;
@@ -219,7 +325,7 @@ function parseDeployment(dep) {
     }
   }
 
-  return { room, rawPoints, spots, rt60, roomTs: dep.roomTs, at: dep.at };
+  return { room, rawPoints, spots, spotsFrom, spotsDerived, rt60, roomTs: dep.roomTs, at: dep.at };
 }
 
 function centre(pts) {
@@ -412,6 +518,7 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
     const COL = {
       edge: cssVar("--orange", "#f6a15c"), raw: cssVar("--violet", "#a98bf5"),
       hot: cssVar("--bad", "#ff5b52"), dead: cssVar("--sim-dead", "#5b9dff"),
+      neutral: cssVar("--sim-neutral", "#e9eaf0"),
       cyan: cssVar("--cyan", "#62d0e0"), device: cssVar("--device", "#c2cae0"),
       // Distinct hues so the two label families never read as the same thing:
       //   dimensions = mint, cardinals = amber. Neither collides with the
@@ -554,16 +661,40 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
       const spotGroup = new THREE.Group();
       const y = Math.min(1.2, h * 0.5);
       model.spots.forEach((s) => {
-        const col = s.type === "hot" ? COL.hot : COL.dead;
-        const info = { type: s.type, value: s.value, x: s.x, z: s.z };
-        const core = new THREE.Mesh(new THREE.SphereGeometry(0.13, 20, 16), new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.6, roughness: 0.4 }));
+        const col = s.type === "hot" ? COL.hot : s.type === "neutral" ? COL.neutral : COL.dead;
+        const info = { type: s.type, value: s.value, x: s.x, z: s.z, angle: s.angle };
+        // Solid, slightly deepened body so the marker reads as an object with a
+        // colour rather than a blown-out light source. The glow is carried by
+        // the sprite behind it, not by over-driving the surface.
+        const solid = new THREE.Color(col).multiplyScalar(0.82);
+        const core = new THREE.Mesh(
+          new THREE.SphereGeometry(0.15, 24, 18),
+          new THREE.MeshStandardMaterial({
+            color: solid, emissive: solid, emissiveIntensity: 0.16,
+            roughness: 0.55, metalness: 0.0,
+          })
+        );
         core.position.set(s.x, y, s.z); core.userData = info;
-        const halo = new THREE.Mesh(new THREE.SphereGeometry(0.34, 20, 16), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.16 }));
-        halo.position.copy(core.position); halo.userData = info;
-        const ring = new THREE.Mesh(new THREE.RingGeometry(0.28, 0.34, 28), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.5, side: THREE.DoubleSide }));
-        ring.rotation.x = -Math.PI / 2; ring.position.set(s.x, 0.02, s.z);
-        spotGroup.add(core, halo, ring);
-        pick.push(core, halo);
+
+        // Billboarded glow. Additive so overlapping markers bloom together
+        // instead of stacking into flat opaque discs.
+        const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: glowTexture(), color: col, transparent: true,
+          blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.9,
+        }));
+        glow.position.copy(core.position);
+        glow.scale.set(0.95, 0.95, 1);
+        glow.renderOrder = 5;
+
+        // Invisible but pickable, so hover keeps the old generous target size.
+        const hit = new THREE.Mesh(
+          new THREE.SphereGeometry(0.34, 12, 10),
+          new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false })
+        );
+        hit.position.copy(core.position); hit.userData = info;
+
+        spotGroup.add(glow, core, hit);
+        pick.push(core, hit);
       });
       content.add(spotGroup); groups.spots = spotGroup;
     }
@@ -661,8 +792,12 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
 
   const toggle = (k) => setLayers((s) => ({ ...s, [k]: !s[k] }));
   const counts = useMemo(() => {
-    if (!model) return { hot: 0, dead: 0 };
-    return { hot: model.spots.filter((s) => s.type === "hot").length, dead: model.spots.filter((s) => s.type === "dead").length };
+    if (!model) return { hot: 0, dead: 0, neutral: 0 };
+    return {
+      hot: model.spots.filter((s) => s.type === "hot").length,
+      dead: model.spots.filter((s) => s.type === "dead").length,
+      neutral: model.spots.filter((s) => s.type === "neutral").length,
+    };
   }, [model]);
 
   /* canvas-only mode (embedded in the Dashboard's Room twin) — the SAME live
@@ -681,11 +816,12 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
         {hasModel && <div className="sim-hint2">drag to orbit · scroll to zoom</div>}
         {hover && (
           <div className="sim-tip" style={{ left: hover.sx + 14, top: hover.sy + 14 }}>
-            <div className={`hd ${hover.type === "hot" ? "hot" : "dead"}`}>
-              <span className={`sd ${hover.type === "hot" ? "hot" : "dead"}`} />
-              {hover.type === "hot" ? "Hotspot" : "Deadspot"}
+            <div className={`hd ${hover.type === "hot" ? "hot" : "dead"}`} style={hover.type === "neutral" ? { color: "var(--sim-neutral)" } : undefined}>
+              <span className={`sd ${hover.type === "hot" ? "hot" : "dead"}`} style={hover.type === "neutral" ? { background: "var(--sim-neutral)" } : undefined} />
+              {SPOT_LABEL[hover.type] || "Spot"}
             </div>
-            {hover.value != null && numish(hover.value) && <div className="ln">Level {Number(hover.value).toLocaleString(undefined, { maximumFractionDigits: 3 })}</div>}
+            {hover.value != null && numish(hover.value) && <div className="ln">RT60 {Number(hover.value).toLocaleString(undefined, { maximumFractionDigits: 3 })} s</div>}
+            {numish(hover.angle) && <div className="ln faint">bearing {Number(hover.angle).toFixed(0)}°</div>}
             <div className="ln faint">x {hover.x.toFixed(2)} m · z {hover.z.toFixed(2)} m</div>
           </div>
         )}
@@ -729,6 +865,7 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
             <div className="sim-legend">
               <span className="hstack"><span className="sd hot" /> Hotspot</span>
               <span className="hstack"><span className="sd dead" /> Deadspot</span>
+              <span className="hstack"><span className="sd" style={{ background: "var(--sim-neutral)" }} /> Neutral</span>
             </div>
             <button className={`btn${orbiting ? "" : " btn--primary"}`} onClick={() => setOrbiting((v) => !v)}>
               {orbiting ? <><Pause size={15} color="var(--ink)" /> Pause</> : <><Play size={15} color="#17131f" /> Start</>}
@@ -757,7 +894,7 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
             <LayerRow tone="shell" label="Room shell (fit)" on={layers.shell} onClick={() => toggle("shell")} disabled={!hasModel} />
             <LayerRow tone="edge" label="Detected edges" on={layers.edges} onClick={() => toggle("edges")} disabled={!hasModel} />
             <LayerRow tone="raw" label={`Raw points${model?.rawPoints?.length ? ` (${model.rawPoints.length})` : ""}`} on={layers.raw} onClick={() => toggle("raw")} disabled={!hasModel || !model?.rawPoints?.length} />
-            <LayerRow tone="hot" label={`Hot / dead spots${model?.spots?.length ? ` (${counts.hot}/${counts.dead})` : ""}`} on={layers.spots} onClick={() => toggle("spots")} disabled={!hasModel || !model?.spots?.length} />
+            <LayerRow tone="hot" label={`Imbalanced sound${model?.spots?.length ? ` (${counts.hot} hot / ${counts.dead} dead / ${counts.neutral} neutral)` : ""}`} on={layers.spots} onClick={() => toggle("spots")} disabled={!hasModel || !model?.spots?.length} />
             <LayerRow tone="cyan" label="Omnidirectional sensor" on={layers.omni} onClick={() => toggle("omni")} disabled={!hasModel} />
             <LayerRow tone="device"
               label={deviceStatus === "error" ? "Prototype — file not found" : deviceStatus === "loading" ? "Prototype — loading…" : "Prototype (device)"}
@@ -773,7 +910,9 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
             }}
           >
             <div style={{ margin: 0 }}>
-              Red marks hotspots, blue marks deadspots — hover a spot for details.
+              Red marks hotspots, blue deadspots, cyan neutral zones — hover a point for details.
+              Bearing-only scans are projected onto the wall each reading faced, so a marker shows
+              the direction measured, not a localised sound source.
             </div>
             {hasModel && !model?.spots?.length && (
               <div
@@ -785,7 +924,8 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
                   lineHeight: 1.55, overflowWrap: "anywhere", hyphens: "auto",
                 }}
               >
-                <b>No spots.</b> The deployed acoustic scan needs x/y columns plus a class or RT60 metric.
+                <b>No spots.</b> The deployed acoustic scan needs either x/y columns or an
+                <code> angle</code> column, plus a classification or RT60 metric.
               </div>
             )}
             {deviceStatus === "error" && (
@@ -812,9 +952,9 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
 
       {hover && (
         <div className="sim-tip" style={{ left: hover.sx + 14, top: hover.sy + 14 }}>
-          <div className={`hd ${hover.type === "hot" ? "hot" : "dead"}`}>
-            <span className={`sd ${hover.type === "hot" ? "hot" : "dead"}`} />
-            {hover.type === "hot" ? "Hotspot" : "Deadspot"}
+          <div className={`hd ${hover.type === "hot" ? "hot" : "dead"}`} style={hover.type === "neutral" ? { color: "var(--sim-neutral)" } : undefined}>
+            <span className={`sd ${hover.type === "hot" ? "hot" : "dead"}`} style={hover.type === "neutral" ? { background: "var(--sim-neutral)" } : undefined} />
+            {SPOT_LABEL[hover.type] || "Spot"}
           </div>
           {hover.value != null && numish(hover.value) && <div className="ln">Level {Number(hover.value).toLocaleString(undefined, { maximumFractionDigits: 3 })}</div>}
           <div className="ln faint">x {hover.x.toFixed(2)} m · z {hover.z.toFixed(2)} m</div>
@@ -850,13 +990,25 @@ function roomGeometry(room) {
 // NRC ratings, which are themselves quantised to 0.05.
 const toNrcStep = (v) => Math.round(v * 20) / 20;
 
+/* Sabine assumes a lightly damped, diffuse field. Past ᾱ ≈ 0.2 it overstates
+   the absorption present, so switch to Eyring for the same measured RT60. */
+const EYRING_LIMIT = 0.2;
+function absorptionFor(V, S, rt60) {
+  const sab = (SABINE_K * V) / rt60;
+  if (sab / S <= EYRING_LIMIT) return { A: sab, model: "Sabine" };
+  const aBar = 1 - Math.exp(-(SABINE_K * V) / (rt60 * S));
+  return { A: S * aBar, model: "Eyring" };
+}
+
 function acousticPlan(room, rt60) {
   if (!room?.w || !room?.l || !numish(rt60) || rt60 <= 0) return null;
   const g = roomGeometry(room);
   const aim = (RT60_TARGET.low + RT60_TARGET.high) / 2;
 
-  const Acur = (SABINE_K * g.V) / rt60;      // absorption the room has now
-  const Aaim = (SABINE_K * g.V) / aim;       // absorption it needs
+  const cur = absorptionFor(g.V, g.total, rt60);
+  const model = cur.model;
+  const Acur = cur.A;                        // absorption the room has now
+  const Aaim = absorptionFor(g.V, g.total, aim).A; // absorption it needs
   const dA = Aaim - Acur;                    // + = add absorption, − = remove it
   const aBar = Acur / g.total;               // current average coefficient
 
@@ -879,7 +1031,59 @@ function acousticPlan(room, rt60) {
   // over a small area, so pick the lowest catalogue rating that fits.
   const practical = nrcFull < 0.35 ? coverage.find((c) => c.ok) || null : null;
 
-  return { ...g, rt60, aim, Acur, Aaim, dA, aBar, treatable, nrcFull, nrcRaw, feasible, coverage, practical };
+  return { ...g, rt60, aim, model, Acur, Aaim, dA, aBar, treatable, nrcFull, nrcRaw, feasible, coverage, practical };
+}
+
+/* ---- placement -------------------------------------------------------- *
+ * Sabine gives a whole-room quantity and has no coordinates in it. The spot
+ * map is what carries location. So: the plan decides HOW MUCH panel to buy,
+ * this decides WHERE it goes.
+ *
+ * Eligibility comes from the Classification tab's label, not from a threshold
+ * computed here — hotspots are treated, neutral zones and deadspots are not.
+ * The measured value is used only to weight the split between hotspots, and
+ * when no value column is present the split is even.
+ * ---------------------------------------------------------------------- */
+function allocateToSpots(spots, totalArea) {
+  const all = (spots || []).map((s, i) => ({ ...s, idx: i + 1 }));
+  if (!all.length || !numish(totalArea) || totalArea <= 0) return null;
+
+  const hot = all.filter((s) => s.type === "hot");
+  if (!hot.length) return null;
+
+  // Field statistics are taken across every reading, so the diffusion check
+  // reflects the whole room rather than just the treated points.
+  const vals = all.map((s) => s.value).filter(numish);
+  const mean = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  const sd = vals.length && mean
+    ? Math.sqrt(vals.reduce((a, v) => a + (v - mean) ** 2, 0) / vals.length)
+    : 0;
+
+  // Weight by how far each hotspot sits above the room mean. Any hotspot at or
+  // below the mean still gets a floor share — the sheet classified it as hot,
+  // so it is not silently dropped.
+  const FLOOR = 0.15;
+  const weighted = hot.map((s) => ({
+    ...s,
+    weight: numish(s.value) && numish(mean) ? Math.max(FLOOR, s.value - mean) : 1,
+  }));
+  const sum = weighted.reduce((a, s) => a + s.weight, 0);
+
+  const rows = weighted
+    .map((s) => ({ ...s, share: s.weight / sum, area: (s.weight / sum) * totalArea }))
+    .sort((a, b) => b.area - a.area);
+
+  return {
+    rows,
+    mean,
+    hotCount: hot.length,
+    skipped: all.length - hot.length,
+    deadCount: all.filter((s) => s.type === "dead").length,
+    cv: mean > 0 ? sd / mean : 0,      // spread of the field, used as a diffusion check
+    diffuse: mean > 0 ? sd / mean <= 0.15 : true,
+    weighted: vals.length > 0,
+    totalArea,
+  };
 }
 
 function buildRecs(model, counts) {
@@ -919,19 +1123,55 @@ function buildRecs(model, counts) {
     }
   }
 
+  // The quantity above is room-wide; this is where it lands. Basis is whichever
+  // catalogue rating the headline recommendation already settled on.
+  const basis = plan && plan.dA > 0 ? (plan.practical || plan.coverage.find((c) => c.ok)) : null;
+  const alloc = basis ? allocateToSpots(model.spots, basis.area) : null;
+
   if (counts.hot > 0) {
     const localNrc = plan ? Math.max(0.6, Math.min(1, toNrcStep(plan.nrcRaw + 0.1))) : 0.85;
     recs.push({
       icon: Volume2, tone: "var(--bad)", title: `${counts.hot} hotspot${counts.hot > 1 ? "s" : ""} — local NRC ${localNrc.toFixed(2)}`,
-      body: `Energy is building up at ${counts.hot === 1 ? "this location" : "these locations"}. Specify a higher local rating — NRC ${localNrc.toFixed(2)} or better — on the two nearest bounding surfaces, rather than spreading the same rating evenly around the room.`,
+      body: alloc && basis
+        ? `Energy is building up at ${counts.hot === 1 ? "this location" : "these locations"}. Split the ${f1(basis.area)} m² of NRC ${basis.nrc.toFixed(2)} coverage across the bounding surfaces below rather than spreading it evenly${alloc.weighted && numish(alloc.mean) ? ` — each share is weighted by how far that reading sits above the room mean of ${f2(alloc.mean)}` : ""}. Raise the rating to NRC ${localNrc.toFixed(2)} on the two surfaces nearest the strongest reading.`
+        : `Energy is building up at ${counts.hot === 1 ? "this location" : "these locations"}. Specify a higher local rating — NRC ${localNrc.toFixed(2)} or better — on the two nearest bounding surfaces, rather than spreading the same rating evenly around the room.`,
+      alloc, basis, kind: "place",
     });
   }
   if (counts.dead > 0) {
     recs.push({
       icon: Radio, tone: "var(--sim-dead)", title: `${counts.dead} deadspot${counts.dead > 1 ? "s" : ""} — cap local NRC at 0.30`,
-      body: `Coverage drops out at ${counts.dead === 1 ? "this location" : "these locations"}. Keep the surrounding surfaces below NRC 0.30 so they stay reflective, or reposition the source. Adding absorption here makes the deadspot worse.`,
+      body: `Coverage drops out at ${counts.dead === 1 ? "this location" : "these locations"}. Absorption cannot restore energy that never arrived, so keep the surrounding surfaces below NRC 0.30 to stay reflective, add diffusion, or reposition the source. These points are excluded from the coverage split above.`,
     });
   }
+
+  // Validity notes. Neither blocks the recommendation; both change how much
+  // weight it should carry when it is defended.
+  if (model.spotsDerived && model.spots?.length) {
+    recs.push({
+      icon: Target, tone: "var(--warn)", title: "Labels derived, not read",
+      body: `No classification column was found in the deployed bundle, so hot / dead labels were split at the median of the level column in “${model.spotsFrom || "the scan data"}”. Publish the Classification tab's label column to have these read directly.`,
+    });
+  }
+  if (alloc && !alloc.diffuse) {
+    recs.push({
+      icon: Target, tone: "var(--warn)", title: "Field is not diffuse — placement over quantity",
+      body: `Level varies ${(alloc.cv * 100).toFixed(0)}% across the acoustic zones, past the 15% at which a room can be treated as a single diffuse field. The room-total figure still holds as a quantity, but where the panels go matters more here than how many are bought.`,
+    });
+  }
+  if (plan && plan.model === "Eyring") {
+    recs.push({
+      icon: Target, tone: "var(--warn)", title: "Eyring model applied",
+      body: `Average absorption is ᾱ ${plan.aBar.toFixed(2)}, above the 0.2 ceiling where Sabine stays accurate. Absorption was solved with Eyring (RT60 = 0.161 V / −S ln(1−ᾱ)) instead.`,
+    });
+  }
+  if (plan && plan.dA > 0) {
+    recs.push({
+      icon: Radio, tone: "var(--faint)", title: "NRC excludes low frequency",
+      body: "NRC averages 250–2000 Hz only; 125 Hz is not in the rating. Any bass buildup or modal problem in this room will survive a panel meeting these figures and needs volume-based treatment instead.",
+    });
+  }
+
   if (!recs.length) {
     recs.push({ icon: CheckCircle2, tone: "var(--ok)", title: "No issues detected",
       body: "The current scan doesn't flag any hotspots or reverberation problems." });
@@ -946,8 +1186,8 @@ function NrcTable({ plan }) {
   const cell = { padding: "6px 10px", textAlign: "right", whiteSpace: "nowrap" };
   const head = { ...cell, fontWeight: 600, opacity: 0.7, borderBottom: "1px solid rgba(255,255,255,0.10)" };
   return (
-    <div style={{ marginTop: 12, overflowX: "auto" }}>
-      <table style={{ borderCollapse: "collapse", fontSize: "0.86em", minWidth: 300 }}>
+    <div style={{ marginTop: 12, overflowX: "auto", minWidth: 0, maxWidth: "100%" }}>
+      <table style={{ borderCollapse: "collapse", fontSize: "0.86em", width: "100%", maxWidth: 520 }}>
         <thead>
           <tr>
             <th style={{ ...head, textAlign: "left" }}>Rating applied</th>
@@ -968,7 +1208,7 @@ function NrcTable({ plan }) {
       <div style={{ marginTop: 8, fontSize: "0.82em", opacity: 0.65, lineHeight: 1.5 }}>
         Room volume {plan.V.toFixed(1)} m³ · treatable surface {plan.treatable.toFixed(1)} m² ·
         current ᾱ {plan.aBar.toFixed(2)} · deficit {plan.dA >= 0 ? "+" : ""}{plan.dA.toFixed(1)} m² sabins.
-        Derived from Sabine (RT60 = 0.161 V / A); floor excluded from treatable area.
+        Derived from {plan.model || "Sabine"} (RT60 = 0.161 V / A); floor excluded from treatable area.
       </div>
       {!plan.feasible && (
         <div style={{ marginTop: 8, fontSize: "0.82em", lineHeight: 1.5, padding: "8px 10px", borderRadius: 8, background: "rgba(255,91,82,0.10)", border: "1px solid rgba(255,91,82,0.30)" }}>
@@ -976,6 +1216,61 @@ function NrcTable({ plan }) {
           Add volume-based absorption (bass traps, freestanding baffles) or relax the RT60 target.
         </div>
       )}
+    </div>
+  );
+}
+
+/* Placement table — the coverage area from NrcTable, shared out across the
+   measured points. This is the half Sabine can't answer. */
+function SpotAllocTable({ alloc, basis }) {
+  if (!alloc || !basis) return null;
+  const cell = { padding: "6px 10px", textAlign: "right", whiteSpace: "nowrap" };
+  const head = { ...cell, fontWeight: 600, opacity: 0.7, borderBottom: "1px solid rgba(255,255,255,0.10)" };
+  const tone = (t) => (t === "hot" ? "var(--bad)" : t === "dead" ? "var(--sim-dead)" : "var(--sim-neutral)");
+
+  // alloc.rows already contains only the rows the Classification tab labelled
+  // as hotspots, so nothing needs filtering out here.
+  const treated = alloc.rows;
+  const skipped = alloc.skipped;
+  if (!treated.length) return null;
+
+  return (
+    <div style={{ marginTop: 12, overflowX: "auto", minWidth: 0, maxWidth: "100%" }}>
+      <table style={{ borderCollapse: "collapse", fontSize: "0.86em", width: "100%", maxWidth: 620 }}>
+        <thead>
+          <tr>
+            <th style={{ ...head, textAlign: "left" }}>Point</th>
+            <th style={{ ...head, textAlign: "left" }}>Bearing</th>
+            <th style={head}>Reading</th>
+            <th style={head}>Share</th>
+            <th style={head}>Area</th>
+          </tr>
+        </thead>
+        <tbody>
+          {treated.map((r) => (
+            <tr key={r.idx}>
+              <td style={{ ...cell, textAlign: "left", color: tone(r.type) }}>
+                {SPOT_LABEL[r.type] || "Spot"} {r.idx}
+              </td>
+              <td style={{ ...cell, textAlign: "left" }}>
+                {numish(r.angle) ? `${Math.round(r.angle)}°` : `x ${r.x.toFixed(1)} · z ${r.z.toFixed(1)}`}
+              </td>
+              <td style={cell}>{numish(r.value) ? r.value.toFixed(2) : "—"}</td>
+              <td style={cell}>{(r.share * 100).toFixed(0)}%</td>
+              <td style={cell}>{r.area.toFixed(1)} m²</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div style={{ marginTop: 8, fontSize: "0.82em", opacity: 0.65, lineHeight: 1.5 }}>
+        {basis.area.toFixed(1)} m² of NRC {basis.nrc.toFixed(2)} split across the{" "}
+        {alloc.hotCount} point{alloc.hotCount > 1 ? "s" : ""} the Classification tab marked as
+        hotspots{alloc.weighted && numish(alloc.mean)
+          ? `, weighted by level above the room mean of ${alloc.mean.toFixed(2)} · spread ${(alloc.cv * 100).toFixed(0)}%`
+          : ", split evenly — no level column in the classification data"}.
+        {skipped > 0 && ` ${skipped} neutral or dead point${skipped > 1 ? "s" : ""} excluded.`}
+        {" "}Mount on the surface each bearing points at, measured from room centre.
+      </div>
     </div>
   );
 }
@@ -993,13 +1288,22 @@ function Recommendations({ model, hasModel, counts }) {
         <div className="rec-grid">
           {buildRecs(model, counts).map((r, i) => {
             const Icon = r.icon;
+            // A card carrying a table needs the whole row — squeezed into a
+            // third of the grid the table overflows its cell and paints over
+            // the neighbouring card.
+            const wide = (r.plan && r.kind !== "hold") || r.kind === "place";
             return (
-              <div key={i} className="rec-cell">
+              <div
+                key={i}
+                className="rec-cell"
+                style={wide ? { gridColumn: "1 / -1", minWidth: 0 } : { minWidth: 0 }}
+              >
                 <span className="ic"><Icon size={16} color={r.tone} /></span>
-                <div>
+                <div style={{ minWidth: 0 }}>
                   <div className="t">{r.title}</div>
                   <div className="n">{r.body}</div>
                   {r.plan && r.kind !== "hold" && <NrcTable plan={r.plan} />}
+                  {r.kind === "place" && <SpotAllocTable alloc={r.alloc} basis={r.basis} />}
                 </div>
               </div>
             );

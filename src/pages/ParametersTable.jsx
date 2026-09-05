@@ -57,6 +57,17 @@ function groupOf(sheet) {
 }
 const isPhysical = (g) => g === "dimensions" || g === "obstacles";
 
+/* Acoustic tables are shown without their timestamp column — acoustics aren't
+   picked by timestamp here. Shared by the on-screen table and the PDF so the
+   two can't diverge. */
+function dropTimeCols(sheet) {
+  if (!sheet) return { columns: [], rows: [], mode: "empty" };
+  const drop = sheet.columns.map((c, i) => (/timestamp|time|date/i.test(c) ? i : -1)).filter((i) => i >= 0);
+  if (!drop.length) return { columns: sheet.columns, rows: sheet.rows, mode: "rows" };
+  const keep = (arr) => arr.filter((_, i) => !drop.includes(i));
+  return { columns: keep(sheet.columns), rows: sheet.rows.map(keep), mode: "rows" };
+}
+
 function linkRows(targetSheet, session, anchorLinkCol, sessions) {
   if (!targetSheet || !session) return { rows: [], method: "none", ts: null };
   const linkT = linkIndex(targetSheet.columns);
@@ -147,13 +158,7 @@ export default function ParametersTable({ onSave } = {}) {
   const physTable = useMemo(() => tableFor(physSheet), [physSheet, session, sessions]);
   // Acoustic table: show the Reverberation/Classification rows as-is, minus the
   // timestamp column (acoustics isn't picked by timestamp here).
-  const acouTable = useMemo(() => {
-    if (!acouSheet) return { columns: [], rows: [], mode: "empty" };
-    const drop = acouSheet.columns.map((c, i) => (/timestamp|time|date/i.test(c) ? i : -1)).filter((i) => i >= 0);
-    if (!drop.length) return { columns: acouSheet.columns, rows: acouSheet.rows, mode: "rows" };
-    const keep = (arr) => arr.filter((_, i) => !drop.includes(i));
-    return { columns: keep(acouSheet.columns), rows: acouSheet.rows.map(keep), mode: "rows" };
-  }, [acouSheet]);
+  const acouTable = useMemo(() => dropTimeCols(acouSheet), [acouSheet]);
 
   const dims = useMemo(() => (session ? dimsFromRow(anchor.columns, session.row) : { width: null, length: null, height: null }), [session, anchor]);
 
@@ -209,15 +214,110 @@ export default function ParametersTable({ onSave } = {}) {
     if (typeof onSave === "function") onSave(saved);
     setToast({ kind: "ok", msg: `Saved room scan ${session.ts} to History` });
   };
-  const exportTable = (name, columns, rows) => {
-    const esc = (c) => { const s = String(c ?? ""); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-    const csv = [columns, ...rows].map((r) => r.map(esc).join(",")).join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = `${(name + (session ? "_" + session.ts : "")).replace(/[^\w.-]+/g, "_")}.csv`;
-    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-    setToast({ kind: "ok", msg: `Exported ${name} to .csv` });
+  /* ---- PDF export ----------------------------------------------------- *
+   * One export for the whole page, not per table. Builds a standalone
+   * document — room scan identity, spatial status, every physical tab and
+   * every acoustic tab — and hands it to the browser's print pipeline, where
+   * "Save as PDF" is the destination. No PDF library needed, so nothing new
+   * to install and nothing to keep in sync with the app's styling.
+   * --------------------------------------------------------------------- */
+  const esc = (v) => String(v ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+  // The same shaping the on-screen tables use, so the PDF can't drift from
+  // what the user is looking at.
+  const reportSection = (id, sheet) => {
+    const physical = isPhysical(groupOf(sheet));
+    const t = physical ? tableFor(sheet) : dropTimeCols(sheet);
+    return { label: sheet.label, kind: physical ? "Physical" : "Acoustic", ...t };
+  };
+
+  const buildReport = () => {
+    const physical = physicalList.map(([id, s]) => reportSection(id, s));
+    const acoustic = acousticList.map(([id, s]) => reportSection(id, s));
+    return [...physical, ...acoustic].filter((s) => s.rows.length > 0);
+  };
+
+  const sectionHtml = (s) => {
+    const head = s.columns.map((c) => `<th>${esc(c || "—")}</th>`).join("");
+    const body = s.rows
+      .map((r) => `<tr>${s.columns.map((_, i) => {
+        const v = r[i];
+        const num = s.mode === "record" ? (i === 1 && numish(v)) : numish(v);
+        return `<td class="${num ? "num" : ""}">${esc(num ? fmtNum(v) : (v ?? "—"))}</td>`;
+      }).join("")}</tr>`)
+      .join("");
+    return `<section class="sec">
+      <h2>${esc(s.label)}<span class="kind">${esc(s.kind)} scan</span></h2>
+      <div class="meta">${s.rows.length} row${s.rows.length === 1 ? "" : "s"}</div>
+      <table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>
+    </section>`;
+  };
+
+  const exportPdf = () => {
+    const sections = buildReport();
+    if (!sections.length) { setToast({ kind: "err", msg: "Nothing to export — import a scan first." }); return; }
+
+    const dim = (v) => (numish(v) ? `${Number(v).toLocaleString(undefined, { maximumFractionDigits: 3 })} m` : "—");
+    const vol = numish(dims.width) && numish(dims.length) && numish(dims.height)
+      ? `${(dims.width * dims.length * dims.height).toFixed(2)} m³` : "—";
+
+    const html = `<!doctype html><html><head><meta charset="utf-8">
+<title>VIBRA scan report${session ? ` — ${esc(session.ts)}` : ""}</title>
+<style>
+  @page { size: A4; margin: 16mm 14mm; }
+  * { box-sizing: border-box; }
+  body { font: 11px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: #14161c; margin: 0; }
+  h1 { font-size: 20px; margin: 0 0 2px; letter-spacing: -0.3px; }
+  .sub { color: #5b6172; margin: 0 0 16px; }
+  .ident { border: 1px solid #d9dce4; border-radius: 6px; padding: 10px 12px; margin-bottom: 18px; }
+  .ident dl { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px 16px; margin: 0; }
+  .ident dt { color: #5b6172; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
+  .ident dd { margin: 0; font-weight: 600; font-size: 13px; }
+  .sec { margin-bottom: 20px; break-inside: auto; }
+  h2 { font-size: 13px; margin: 0 0 2px; display: flex; align-items: baseline; gap: 8px; }
+  .kind { font-size: 10px; font-weight: 500; color: #5b6172; text-transform: uppercase; letter-spacing: 0.04em; }
+  .meta { color: #5b6172; font-size: 10px; margin-bottom: 6px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #d9dce4; padding: 4px 7px; text-align: left; vertical-align: top; }
+  th { background: #f1f2f6; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  thead { display: table-header-group; }
+  tr { break-inside: avoid; }
+  footer { margin-top: 18px; padding-top: 8px; border-top: 1px solid #d9dce4; color: #5b6172; font-size: 10px; }
+</style></head><body>
+<h1>VIBRA — room scan report</h1>
+<p class="sub">LiDAR physical scan and sound-sensor acoustic scan.</p>
+<div class="ident"><dl>
+  <div><dt>Room scan</dt><dd>${esc(session ? session.ts : "—")}</dd></div>
+  <div><dt>Width</dt><dd>${dim(dims.width)}</dd></div>
+  <div><dt>Length</dt><dd>${dim(dims.length)}</dd></div>
+  <div><dt>Height</dt><dd>${dim(dims.height)}</dd></div>
+  <div><dt>Volume</dt><dd>${vol}</dd></div>
+  <div><dt>Tables</dt><dd>${sections.length}</dd></div>
+  <div><dt>Exported</dt><dd>${esc(new Date().toLocaleString())}</dd></div>
+</dl></div>
+${sections.map(sectionHtml).join("")}
+<footer>Generated by VIBRA. Dimensions from the LiDAR pass; acoustic values from the sound-sensor pass.</footer>
+</body></html>`;
+
+    // A hidden same-origin iframe rather than window.open — popup blockers
+    // don't touch it, and the print dialog is scoped to the report alone.
+    const frame = document.createElement("iframe");
+    frame.setAttribute("aria-hidden", "true");
+    frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden;";
+    document.body.appendChild(frame);
+    const done = () => setTimeout(() => frame.remove(), 1000);
+    frame.onload = () => {
+      try {
+        frame.contentWindow.focus();
+        frame.contentWindow.print();
+        setToast({ kind: "ok", msg: "Report ready — choose “Save as PDF” in the print dialog." });
+      } catch (err) {
+        setToast({ kind: "err", msg: `Couldn't open the print dialog — ${err.message}` });
+      } finally { done(); }
+    };
+    frame.srcdoc = html;
   };
   const loadBundle = (entry) => {
     if (!entry || !entry.tabs) return;
@@ -289,6 +389,9 @@ export default function ParametersTable({ onSave } = {}) {
         <div className="pt-actions">
           <button className="btn btn--primary" onClick={deploy} disabled={!session}><Rocket size={15} color="#17131f" /><span>Deploy</span></button>
           <button className="btn btn--save" onClick={saveView} disabled={!session}><Save size={15} color="var(--ok)" /><span>Save</span></button>
+          <button className="btn" onClick={exportPdf} disabled={!hasSheets} title="Export the whole page as PDF">
+            <Download size={15} color="var(--muted)" /><span>Export PDF</span>
+          </button>
           {resetArmed ? (
             <>
               <button className="btn btn--danger" onClick={resetAll}>Confirm reset</button>
@@ -307,16 +410,14 @@ export default function ParametersTable({ onSave } = {}) {
             title="Physical scan" subtitle="LiDAR · dimensions & obstacles"
             tabs={physicalList} activeId={physId} onTab={setPhysId} sheets={sheets}
             table={physTable} hasSheets={hasSheets} session={session}
-            emptyHint="Import to load the room dimensions and obstacle scan."
-            onExport={() => physSheet && exportTable(physSheet.label, physTable.columns, physTable.rows)} />
+            emptyHint="Import to load the room dimensions and obstacle scan." />
         </div>
         <div className="pt-cell">
           <ScanSection variant="c" icon={<Volume2 size={16} color="var(--cyan)" />} acoustic
             title="Acoustic scan" subtitle="Sound sensor · reverberation & classification"
             tabs={acousticList} activeId={acouId} onTab={setAcouId} sheets={sheets}
             table={acouTable} hasSheets={hasSheets} session={session}
-            emptyHint="Run the sound-sensor pass, or import the acoustic sheets."
-            onExport={() => acouSheet && exportTable(acouSheet.label, acouTable.columns, acouTable.rows)} />
+            emptyHint="Run the sound-sensor pass, or import the acoustic sheets." />
         </div>
       </div>
 
@@ -345,7 +446,7 @@ export default function ParametersTable({ onSave } = {}) {
 }
 
 /* ---- sensor section ---- */
-function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sheets, table, hasSheets, session, acoustic = false, emptyHint, onExport }) {
+function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sheets, table, hasSheets, session, acoustic = false, emptyHint }) {
   const activeSheet = sheets[activeId];
   return (
     <section className="scan">
@@ -359,9 +460,6 @@ function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sh
               <button key={id} className={`seg-btn${activeId === id ? " active" : ""}`} onClick={() => onTab(id)}>{s.label}</button>
             ))}
           </div>
-        )}
-        {activeSheet && table.rows.length > 0 && (
-          <button className="btn btn--icon" onClick={onExport} title="Export this table"><Download size={14} color="var(--muted)" /></button>
         )}
       </div>
 

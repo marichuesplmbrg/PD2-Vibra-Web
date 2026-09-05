@@ -1,17 +1,13 @@
 import React from "react";
 import { NavLink } from "react-router-dom";
 import {
-  Sparkle,
   LayoutGrid,
   Table2,
   History,
   Activity,
-  Target,
   ClipboardList,
   Users,
   Settings2,
-  LogOut,
-  Waves,
 } from "lucide-react";
 
 const PRIMARY = [
@@ -43,12 +39,19 @@ function Item({ to, label, icon: Icon, end }) {
 export default function Sidebar() {
   return (
     <aside className="sidebar">
-      <div className="brand">
-        <div className="logo">
-          <Sparkle size={17} fill="#17131f" />
-        </div>
+      <NavLink
+        to="/"
+        end
+        className="brand"
+        aria-label="VIBRA — go to dashboard"
+      >
+        <img
+          src="/logo/No-bg-Vibra-logo.png"
+          alt=""
+          className="brand-logo"
+        />
         <div className="name">VIBRA</div>
-      </div>
+      </NavLink>
 
       {PRIMARY.map((i) => (
         <Item key={i.to} {...i} />
@@ -61,8 +64,6 @@ export default function Sidebar() {
       ))}
 
       <div className="spacer" />
-
     </aside>
   );
 }
-
