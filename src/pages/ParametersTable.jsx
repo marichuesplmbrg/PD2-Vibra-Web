@@ -287,7 +287,7 @@ export default function ParametersTable({ onSave } = {}) {
         </div>
 
         <div className="pt-actions">
-          <button className="btn btn--primary" onClick={deploy} disabled={!session}><Rocket size={15} color="#17131f" /><span>Deploy to Simulation</span></button>
+          <button className="btn btn--primary" onClick={deploy} disabled={!session}><Rocket size={15} color="#17131f" /><span>Deploy</span></button>
           <button className="btn btn--save" onClick={saveView} disabled={!session}><Save size={15} color="var(--ok)" /><span>Save</span></button>
           {resetArmed ? (
             <>
@@ -365,23 +365,40 @@ function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sh
         )}
       </div>
 
-      <ScanTable columns={table.columns} rows={table.rows} mode={table.mode}
+      <ScanTable columns={table.columns} rows={table.rows} mode={table.mode} packLeft={acoustic}
         empty={!hasSheets ? "Nothing imported yet." : !activeSheet ? emptyHint : (acoustic ? "No values." : !session ? "Select a room scan above." : (table.mode === "rows" ? "No data for this room scan." : "No values."))} />
     </section>
   );
 }
 
-/* ---- table ---- */
-function ScanTable({ columns, rows, mode, empty }) {
+/* ---- table ----
+ * `packLeft` adds a zero-content filler column that soaks up all the leftover
+ * width. Without it the table stretches its real columns to fill 100%, which is
+ * why dropping the timestamp column left the acoustic values drifting rightward
+ * and unevenly spaced. With it, each real column shrinks to its content and the
+ * whole set sits flush left. */
+function ScanTable({ columns, rows, mode, empty, packLeft = false }) {
   const numericCols = useMemo(() => {
     const sample = rows.slice(0, 60);
     return columns.map((_, i) => { const vals = sample.map((r) => r[i]).filter((v) => v !== "" && v != null); return vals.length > 0 && vals.every(numish); });
   }, [columns, rows]);
+  const hug = packLeft && columns.length > 0;
   return (
     <div className="scan-body thin-scroll">
       <table className="dtable">
         <thead>
-          <tr>{columns.map((c, i) => <th key={i} className={numericCols[i] ? "num" : undefined}>{c || "—"}</th>)}</tr>
+          <tr>
+            {columns.map((c, i) => (
+              <th
+                key={i}
+                className={numericCols[i] ? "num" : undefined}
+                style={hug ? { width: "1%", whiteSpace: "nowrap", textAlign: "left" } : undefined}
+              >
+                {c || "—"}
+              </th>
+            ))}
+            {hug && <th aria-hidden="true" style={{ width: "100%" }} />}
+          </tr>
         </thead>
         <tbody>
           {rows.map((row, ri) => (
@@ -390,11 +407,20 @@ function ScanTable({ columns, rows, mode, empty }) {
                 const val = row[ci];
                 const numeric = mode === "record" ? (ci === 1 && numish(val)) : numericCols[ci];
                 const cls = `${numeric ? "num" : ""}${ci === 0 ? " emph" : ""}`.trim();
-                return <td key={ci} className={cls || undefined}>{numeric ? fmtNum(val) : (val || "—")}</td>;
+                return (
+                  <td
+                    key={ci}
+                    className={cls || undefined}
+                    style={hug ? { width: "1%", whiteSpace: "nowrap", textAlign: "left" } : undefined}
+                  >
+                    {numeric ? fmtNum(val) : (val || "—")}
+                  </td>
+                );
               })}
+              {hug && <td aria-hidden="true" />}
             </tr>
           ))}
-          {rows.length === 0 && <tr><td className="empty" colSpan={Math.max(columns.length, 1)}>{empty}</td></tr>}
+          {rows.length === 0 && <tr><td className="empty" colSpan={Math.max(columns.length, 1) + (hug ? 1 : 0)}>{empty}</td></tr>}
         </tbody>
       </table>
     </div>

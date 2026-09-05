@@ -18,19 +18,22 @@ const css = `
   --purple: #b06cf0;
 
   color: var(--text);
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
-  padding: 44px 48px 64px;
+  /* Matches .vwrap in styles.css so the title lands in the same spot as on
+     every other page. */
+  padding: 26px 34px 40px;
   min-width: 0;
 }
 .vibra-instructions * { box-sizing: border-box; }
 
+/* Matches .vhead h1 / .vhead .sub in styles.css. */
 .vibra-instructions .page-head { max-width: 1080px; }
-.vibra-instructions .page-head h1 { margin: 0; font-size: 30px; font-weight: 800; color: var(--heading); letter-spacing: -0.01em; }
-.vibra-instructions .page-head p { margin: 8px 0 0; color: var(--muted); font-size: 15px; }
+.vibra-instructions .page-head h1 { margin: 0 0 4px; font-size: 30px; font-weight: 800; color: var(--heading); letter-spacing: -.4px; }
+.vibra-instructions .page-head p { margin: 0 0 18px; color: #8b90a4; font-size: 15px; }
 
 .vibra-instructions .grid {
-  margin-top: 30px; display: grid;
+  margin-top: 0; display: grid;
   grid-template-columns: repeat(2, minmax(0,1fr));
   gap: 20px; max-width: 1080px;
 }
@@ -105,7 +108,7 @@ const css = `
 
 @media (max-width: 880px) {
   .vibra-instructions .grid { grid-template-columns: 1fr; }
-  .vibra-instructions { padding: 32px 24px 48px; }
+  .vibra-instructions { padding: 22px 20px 40px; }
 }
 `;
 

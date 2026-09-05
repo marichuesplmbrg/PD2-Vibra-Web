@@ -18,7 +18,13 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
   ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
 }
-function makeLabel(text, { fg = "#e9eaf0", worldH = 0.34 } = {}) {
+// `accent` tints the pill's border/background so a label group (cardinals vs
+// dimensions) reads as one family at a glance.
+function hexToRgb(hex) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(String(hex).trim());
+  return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : [233, 234, 240];
+}
+function makeLabel(text, { fg = "#e9eaf0", worldH = 0.34, accent = null } = {}) {
   const fontPx = 46, padX = 22, padY = 14;
   const meas = document.createElement("canvas").getContext("2d");
   meas.font = `600 ${fontPx}px system-ui, -apple-system, Segoe UI, sans-serif`;
@@ -27,8 +33,12 @@ function makeLabel(text, { fg = "#e9eaf0", worldH = 0.34 } = {}) {
   const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
   const ctx = cv.getContext("2d");
   ctx.font = `600 ${fontPx}px system-ui, -apple-system, Segoe UI, sans-serif`;
-  ctx.fillStyle = "rgba(23,26,36,0.92)"; roundRect(ctx, 0, 0, w, h, h / 2); ctx.fill();
-  ctx.strokeStyle = "rgba(255,255,255,0.10)"; ctx.lineWidth = 2; roundRect(ctx, 1, 1, w - 2, h - 2, (h - 2) / 2); ctx.stroke();
+  const [ar, ag, ab] = hexToRgb(accent || fg);
+  ctx.fillStyle = accent ? `rgba(${Math.round(ar * 0.22)},${Math.round(ag * 0.22)},${Math.round(ab * 0.22)},0.94)` : "rgba(23,26,36,0.92)";
+  roundRect(ctx, 0, 0, w, h, h / 2); ctx.fill();
+  ctx.strokeStyle = accent ? `rgba(${ar},${ag},${ab},0.85)` : "rgba(255,255,255,0.10)";
+  ctx.lineWidth = accent ? 3 : 2;
+  roundRect(ctx, 1.5, 1.5, w - 3, h - 3, (h - 3) / 2); ctx.stroke();
   ctx.fillStyle = fg; ctx.textBaseline = "middle"; ctx.fillText(text, padX, h / 2 + 2);
   const tex = new THREE.CanvasTexture(cv);
   tex.minFilter = THREE.LinearFilter;
@@ -129,13 +139,22 @@ function colIdx(cols, re) { return cols.findIndex((c) => re.test(c)); }
 
 function parseDeployment(dep) {
   if (!dep) return null;
+  // A deployment record can exist while carrying nothing usable — an empty
+  // bundle, a cleared table, or a stale entry whose dimension fields are still
+  // populated. Reject those here so the page treats them as "not deployed".
+  const tabsRaw = dep.tabs || {};
+  const hasAnyRow = Object.values(tabsRaw).some((t) => Array.isArray(t?.rows) && t.rows.length > 0);
+  if (!hasAnyRow) return null;
+
   const dims = dep.dims || {};
+  const pos = (v) => (numish(v) && +v > 0 ? +v : null); // zero / negative are not a room
   const room = {
-    w: numish(dims.width) ? +dims.width : null,
-    l: numish(dims.length) ? +dims.length : null,
-    h: numish(dims.height) ? +dims.height : null,
+    w: pos(dims.width),
+    l: pos(dims.length),
+    h: pos(dims.height),
   };
-  const tabs = dep.tabs || {};
+  if (!room.w || !room.l) return null;
+  const tabs = tabsRaw;
 
   // --- raw points (obstacle / point cloud) ---
   let rawPoints = [];
@@ -235,7 +254,9 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
   const [deviceStatus, setDeviceStatus] = useState("idle"); // idle|loading|ready|error
   const deviceHref = deviceUrl || DEVICE_URL;
 
-  useEffect(() => vibraHistory.onDeploy(setDep), []);
+  // A cleared deployment arrives as null. Wrap the setter so React never
+  // mistakes a payload for a functional state update.
+  useEffect(() => vibraHistory.onDeploy((payload) => setDep(payload ?? null)), []);
 
   // Load the prototype model. Try to fetch a served STL first (so you can swap
   // the file without a rebuild); if none is reachable — or the server returns an
@@ -279,6 +300,8 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
   }, [deviceHref]);
 
   const model = useMemo(() => parseDeployment(dep), [dep]);
+  // Nothing is drawn — and the canvas isn't even mounted — until a scan lands.
+  const hasModel = !!(model && model.room.w && model.room.l);
 
   const mountRef = useRef(null);
   const three = useRef(null);
@@ -372,7 +395,7 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
       if (dom.parentNode === mount) mount.removeChild(dom);
       three.current = null;
     };
-  }, []);
+  }, [hasModel]);
 
   /* (re)build scene contents when the model or layers change */
   useEffect(() => {
@@ -386,16 +409,47 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
 
     const { w, l } = model.room;
     const h = model.room.h || 2.6;
-    const COL = { edge: cssVar("--orange", "#f6a15c"), raw: cssVar("--violet", "#a98bf5"), hot: cssVar("--bad", "#ff5b52"), dead: cssVar("--sim-dead", "#5b9dff"), cyan: cssVar("--cyan", "#62d0e0"), device: cssVar("--device", "#c2cae0") };
+    const COL = {
+      edge: cssVar("--orange", "#f6a15c"), raw: cssVar("--violet", "#a98bf5"),
+      hot: cssVar("--bad", "#ff5b52"), dead: cssVar("--sim-dead", "#5b9dff"),
+      cyan: cssVar("--cyan", "#62d0e0"), device: cssVar("--device", "#c2cae0"),
+      // Distinct hues so the two label families never read as the same thing:
+      //   dimensions = mint, cardinals = amber. Neither collides with the
+      //   orange detected-edge line, the violet points or the cyan sensor.
+      dim: cssVar("--sim-dim", "#5ee6b0"),
+      card: cssVar("--sim-card", "#ffd166"),
+      wall: cssVar("--sim-wall", "#4a5891"),
+    };
 
     // room shell (fit) — wire box + faint floor
     const shell = new THREE.Group();
     const box = new THREE.BoxGeometry(w, h, l);
-    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(box), new THREE.LineBasicMaterial({ color: 0x8a93c9, transparent: true, opacity: 0.55 }));
+
+    // Solid-ish wall + ceiling faces. BackSide means we render the *inside* of
+    // the box, so the near wall never hides the contents — the room reads as a
+    // glass enclosure rather than a bare wire cage. depthWrite:false keeps the
+    // points, spots and device drawing through it.
+    const walls = new THREE.Mesh(box.clone(), new THREE.MeshStandardMaterial({
+      color: new THREE.Color(COL.wall), transparent: true, opacity: 0.34,
+      side: THREE.BackSide, depthWrite: false, roughness: 0.95, metalness: 0.0,
+    }));
+    walls.position.y = h / 2; shell.add(walls);
+
+    // A second, fainter pass on the front faces adds a glassy sheen so the
+    // enclosure still has edges to catch light from outside.
+    const glass = new THREE.Mesh(box.clone(), new THREE.MeshStandardMaterial({
+      color: new THREE.Color(COL.wall), transparent: true, opacity: 0.10,
+      side: THREE.FrontSide, depthWrite: false, roughness: 0.6, metalness: 0.1,
+    }));
+    glass.position.y = h / 2; shell.add(glass);
+
+    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(box), new THREE.LineBasicMaterial({ color: 0x9fa9dd, transparent: true, opacity: 0.8 }));
     edges.position.y = h / 2;
     shell.add(edges);
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(w, l), new THREE.MeshBasicMaterial({ color: 0x141b30, transparent: true, opacity: 0.55, side: THREE.DoubleSide }));
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(w, l), new THREE.MeshBasicMaterial({ color: 0x1b2440, transparent: true, opacity: 0.85, side: THREE.DoubleSide }));
     floor.rotation.x = -Math.PI / 2; floor.position.y = 0.001; shell.add(floor);
+    const ceiling = new THREE.Mesh(new THREE.PlaneGeometry(w, l), new THREE.MeshBasicMaterial({ color: 0x1b2440, transparent: true, opacity: 0.32, side: THREE.DoubleSide, depthWrite: false }));
+    ceiling.rotation.x = -Math.PI / 2; ceiling.position.y = h - 0.001; shell.add(ceiling);
 
     // full-floor grid — large 1 m cells, effectively limitless: the extent sits
     // far beyond the camera's max zoom, so no edge is ever visible.
@@ -416,8 +470,8 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
 
     // ---- dimension rulers (width / length / height) ----
     // Text tier is a bit smaller than the cardinal directions below.
-    const dimStyle = { fg: "#dfe3ef", worldH: 0.26 };
-    const rulerMat = new THREE.LineBasicMaterial({ color: new THREE.Color(cssVar("--ruler", "#aeb6d6")), transparent: true, opacity: 0.9 });
+    const dimStyle = { fg: "#d8fff0", worldH: 0.26, accent: COL.dim };
+    const rulerMat = new THREE.LineBasicMaterial({ color: new THREE.Color(COL.dim), transparent: true, opacity: 0.85 });
     const seg = (ax, ay, az, bx, by, bz) =>
       shell.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(ax, ay, az), new THREE.Vector3(bx, by, bz)]), rulerMat));
     const rOff = Math.max(0.28, Math.max(w, l) * 0.08); // how far rulers sit outside the room
@@ -456,9 +510,18 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
     }
 
     // ---- cardinal directions — bigger, and set farther out from the room ----
-    const cardStyle = { fg: "#eef1fa", worldH: 0.38 };
+    const cardStyle = { fg: "#fff4d6", worldH: 0.38, accent: COL.card };
     const cOff = Math.max(1.5, Math.max(w, l) * 0.35);
     const cy = 0.05;
+    // Short amber pointer strokes on the floor tie each pill to its bearing.
+    const cardMat = new THREE.LineBasicMaterial({ color: new THREE.Color(COL.card), transparent: true, opacity: 0.6 });
+    const cardSeg = (ax, az, bx, bz) =>
+      shell.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(ax, 0.02, az), new THREE.Vector3(bx, 0.02, bz)]), cardMat));
+    const cTick = Math.max(0.18, cOff * 0.22);
+    cardSeg(0, -l / 2 - cOff + cTick, 0, -l / 2 - cOff - cTick * 0.2);
+    cardSeg(w / 2 + cOff - cTick, 0, w / 2 + cOff + cTick * 0.2, 0);
+    cardSeg(0, l / 2 + cOff - cTick, 0, l / 2 + cOff + cTick * 0.2);
+    cardSeg(-w / 2 - cOff + cTick, 0, -w / 2 - cOff - cTick * 0.2, 0);
     addLabel(makeLabel("N 0°", cardStyle), 0, cy, -l / 2 - cOff);
     addLabel(makeLabel("E 90°", cardStyle), w / 2 + cOff, cy, 0);
     addLabel(makeLabel("S 180°", cardStyle), 0, cy, l / 2 + cOff);
@@ -512,17 +575,43 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
     {
       const omni = new THREE.Group();
       const cyan = COL.cyan;
-      const y = h / 2;                                   // centre of the room height
-      const maxR = Math.min(w / 2, l / 2, h / 2) * 0.95; // limited by the nearest surface
-      const nodeR = Math.max(0.05, maxR * 0.12);
+      const y = h / 2;                     // field is centred in the room volume
+      // The field is an ELLIPSOID matched to the room's physical box, not a
+      // sphere clamped to the smallest dimension. Each shell is a unit sphere
+      // scaled by (w/2, h/2, l/2), so the outer shell touches all six surfaces
+      // at once — walls, ceiling AND floor. That is the point being shown: the
+      // mic is omnidirectional, so vertical pickup is not an afterthought.
+      const INSET = 0.97;
+      const rx = (w / 2) * INSET, ry = (h / 2) * INSET, rz = (l / 2) * INSET;
+      const nodeR = Math.max(0.05, Math.min(rx, ry, rz) * 0.14);
+
       const node = new THREE.Mesh(new THREE.SphereGeometry(nodeR, 20, 16), new THREE.MeshStandardMaterial({ color: cyan, emissive: cyan, emissiveIntensity: 0.7, roughness: 0.3 }));
       node.position.set(0, y, 0); omni.add(node);
+
       [0.42, 0.7, 1.0].forEach((f, i) => {
-        const shell = new THREE.Mesh(new THREE.SphereGeometry(maxR * f, 24, 16), new THREE.MeshBasicMaterial({ color: cyan, wireframe: true, transparent: true, opacity: 0.2 - i * 0.045 }));
-        shell.position.set(0, y, 0); omni.add(shell);
+        const s = new THREE.Mesh(
+          new THREE.SphereGeometry(1, 26, 18),
+          new THREE.MeshBasicMaterial({ color: cyan, wireframe: true, transparent: true, opacity: 0.2 - i * 0.045, depthWrite: false })
+        );
+        s.scale.set(rx * f, ry * f, rz * f);
+        s.position.set(0, y, 0); omni.add(s);
       });
-      const stand = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(0, y, 0)]), new THREE.LineBasicMaterial({ color: cyan, transparent: true, opacity: 0.4 }));
-      omni.add(stand);
+
+      // Vertical axis through the whole room height, plus rings laid flat on the
+      // floor and ceiling, so the up/down coverage reads even from a low camera.
+      const axisMat = new THREE.LineBasicMaterial({ color: cyan, transparent: true, opacity: 0.45, depthWrite: false });
+      omni.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(0, h - 0.02, 0)]), axisMat));
+      [[0.03, 0.4], [h - 0.03, 0.28]].forEach(([py, op]) => {
+        const ringR = Math.min(rx, rz);
+        const ring = new THREE.Mesh(
+          new THREE.RingGeometry(ringR * 0.9, ringR, 48),
+          new THREE.MeshBasicMaterial({ color: cyan, transparent: true, opacity: op, side: THREE.DoubleSide, depthWrite: false })
+        );
+        ring.rotation.x = -Math.PI / 2;
+        ring.scale.set(rx / ringR, rz / ringR, 1); // match the room footprint
+        ring.position.y = py; omni.add(ring);
+      });
+
       content.add(omni); groups.omni = omni;
     }
 
@@ -571,7 +660,6 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
   useEffect(() => { if (three.current) applyLayers(three.current.groups, layers); }, [layers]);
 
   const toggle = (k) => setLayers((s) => ({ ...s, [k]: !s[k] }));
-  const hasModel = model && model.room.w && model.room.l;
   const counts = useMemo(() => {
     if (!model) return { hot: 0, dead: 0 };
     return { hot: model.spots.filter((s) => s.type === "hot").length, dead: model.spots.filter((s) => s.type === "dead").length };
@@ -605,11 +693,32 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
     );
   }
 
+  /* Nothing deployed — the page stays blank. No canvas, no layers panel, no
+     recommendations table: an empty scaffold reads as broken, and the disabled
+     checkboxes suggested state that does not exist yet. */
+  if (!hasModel) {
+    return (
+      <div className="vwrap">
+        <div className="vhead">
+          <h1>Simulation</h1>
+          <p className="sub">Deploy a room scan to build the twin</p>
+        </div>
+        <section className="sim-livebox" style={{ minHeight: 320, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div className="sim-empty" style={{ position: "static", textAlign: "center", padding: 24 }}>
+            <Radio size={26} color="var(--faint)" />
+            <div className="big">Nothing deployed yet.</div>
+            <div className="small">Open the Parameters table, pick a room scan, and press <b className="ink">Deploy to Simulation</b>.</div>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   return (
     <div className="vwrap">
       <div className="vhead">
         <h1>Simulation</h1>
-        <p className="sub">{hasModel ? `Live scan${model.roomTs ? ` · ${model.roomTs}` : ""}` : "Deploy a room scan to build the twin"}</p>
+        <p className="sub">{`Live scan${model.roomTs ? ` · ${model.roomTs}` : ""}`}</p>
       </div>
 
       <div className="sim-boxes">
@@ -638,10 +747,13 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
           </div>
         </section>
 
-        {/* Layers */}
+        {/* Layers — only exists once something is actually deployed. The
+            `hasModel` guard here is belt-and-braces: the page already
+            early-returns above, so this branch should never be false. */}
+        {hasModel && (
         <section className="sim-layerbox">
           <div className="layers-head"><div className="t">Layers</div><div className="s">Toggle what's drawn</div></div>
-          <div className="layers-body thin-scroll">
+          <div className="layers-body thin-scroll" style={{ flex: "0 0 auto" }}>
             <LayerRow tone="shell" label="Room shell (fit)" on={layers.shell} onClick={() => toggle("shell")} disabled={!hasModel} />
             <LayerRow tone="edge" label="Detected edges" on={layers.edges} onClick={() => toggle("edges")} disabled={!hasModel} />
             <LayerRow tone="raw" label={`Raw points${model?.rawPoints?.length ? ` (${model.rawPoints.length})` : ""}`} on={layers.raw} onClick={() => toggle("raw")} disabled={!hasModel || !model?.rawPoints?.length} />
@@ -651,12 +763,48 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
               label={deviceStatus === "error" ? "Prototype — file not found" : deviceStatus === "loading" ? "Prototype — loading…" : "Prototype (device)"}
               on={layers.device} onClick={() => toggle("device")} disabled={!hasModel || !deviceGeo} />
           </div>
-          <div className="layer-note">
-            Red marks hotspots, blue marks deadspots — hover a spot for details.
-            {hasModel && (!model?.spots?.length) && <div className="warn">No spots — the deployed acoustic scan needs x/y columns and a class or RT60 metric.</div>}
-            {deviceStatus === "error" && <div className="warn">Prototype not found at “{deviceHref}”.</div>}
+          <div
+            className="layer-note"
+            style={{
+              margin: "14px 14px 0", paddingTop: 14, paddingLeft: 0, paddingRight: 0,
+              borderTop: "1px solid rgba(255,255,255,0.08)",
+              display: "flex", flexDirection: "column", gap: 10,
+              lineHeight: 1.55, textAlign: "left", fontSize: "0.86em",
+            }}
+          >
+            <div style={{ margin: 0 }}>
+              Red marks hotspots, blue marks deadspots — hover a spot for details.
+            </div>
+            {hasModel && !model?.spots?.length && (
+              <div
+                className="warn"
+                style={{
+                  margin: 0, padding: "10px 12px", borderRadius: 8,
+                  background: "rgba(246,161,92,0.10)",
+                  border: "1px solid rgba(246,161,92,0.30)",
+                  lineHeight: 1.55, overflowWrap: "anywhere", hyphens: "auto",
+                }}
+              >
+                <b>No spots.</b> The deployed acoustic scan needs x/y columns plus a class or RT60 metric.
+              </div>
+            )}
+            {deviceStatus === "error" && (
+              <div
+                className="warn"
+                style={{
+                  margin: 0, padding: "10px 12px", borderRadius: 8,
+                  background: "rgba(255,91,82,0.10)",
+                  border: "1px solid rgba(255,91,82,0.30)",
+                  lineHeight: 1.55, overflowWrap: "anywhere", hyphens: "auto",
+                }}
+              >
+                Prototype not found at “{deviceHref}”.
+              </div>
+            )}
           </div>
+          <div style={{ flex: "1 1 auto" }} />
         </section>
+        )}
       </div>
 
       {/* Recommendations */}
@@ -676,29 +824,160 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
   );
 }
 
-/* ---- recommendations ---- */
+/* ---- recommendations ---- *
+ * The plan is expressed as a REQUIRED NRC, not as a named product. We solve
+ * Sabine's equation for the absorption the room is missing, then divide that
+ * deficit by the surface available to treat. The result is a coefficient the
+ * installer can shop against, whatever material they end up buying.
+ *
+ *   RT60 = 0.161 · V / A          (metric Sabine)
+ *   A    = 0.161 · V / RT60       -> total absorption, in m² sabins
+ *   ΔA   = A_target − A_current   -> what the room is short by
+ *   NRC  = ᾱ_current + ΔA / S_treated
+ * ------------------------------------------------------------------ */
+const SABINE_K = 0.161;
+const NRC_CATALOGUE = [0.55, 0.70, 0.85, 1.00]; // common commercial ratings
+
+function roomGeometry(room) {
+  const w = room.w, l = room.l, h = room.h || 2.6;
+  const walls = 2 * (w + l) * h;
+  const ceiling = w * l;
+  const floor = w * l;
+  return { w, l, h, V: w * l * h, walls, ceiling, floor, total: walls + ceiling + floor };
+}
+
+// Round to the nearest 0.05 — finer than that is meaningless against published
+// NRC ratings, which are themselves quantised to 0.05.
+const toNrcStep = (v) => Math.round(v * 20) / 20;
+
+function acousticPlan(room, rt60) {
+  if (!room?.w || !room?.l || !numish(rt60) || rt60 <= 0) return null;
+  const g = roomGeometry(room);
+  const aim = (RT60_TARGET.low + RT60_TARGET.high) / 2;
+
+  const Acur = (SABINE_K * g.V) / rt60;      // absorption the room has now
+  const Aaim = (SABINE_K * g.V) / aim;       // absorption it needs
+  const dA = Aaim - Acur;                    // + = add absorption, − = remove it
+  const aBar = Acur / g.total;               // current average coefficient
+
+  // Floor is left out of the treatable area — it carries furniture and traffic,
+  // so walls + ceiling is what a real install can actually reach.
+  const treatable = g.walls + g.ceiling;
+  const nrcRaw = aBar + dA / treatable;
+  const nrcFull = Math.max(0, Math.min(1, toNrcStep(nrcRaw)));
+  const feasible = nrcRaw <= 1.0;
+
+  // Partial coverage: how much area each catalogue rating would have to cover.
+  const coverage = NRC_CATALOGUE.map((nrc) => {
+    const gain = nrc - aBar;                 // net absorption gained per m²
+    const area = gain > 0 ? dA / gain : Infinity;
+    return { nrc, area, pct: (area / treatable) * 100, ok: area > 0 && area <= treatable };
+  });
+
+  // A full-surface answer below ~0.35 is real but unbuyable — nobody stocks an
+  // NRC 0.15 panel. In that case the honest recommendation is a normal rating
+  // over a small area, so pick the lowest catalogue rating that fits.
+  const practical = nrcFull < 0.35 ? coverage.find((c) => c.ok) || null : null;
+
+  return { ...g, rt60, aim, Acur, Aaim, dA, aBar, treatable, nrcFull, nrcRaw, feasible, coverage, practical };
+}
+
 function buildRecs(model, counts) {
   const recs = [];
   const rt = model.rt60;
+  const plan = acousticPlan(model.room, rt);
+  const f1 = (n) => Number(n).toFixed(1);
+  const f2 = (n) => Number(n).toFixed(2);
+
   if (numish(rt)) {
     if (rt > RT60_TARGET.high) {
-      recs.push({ icon: TrendingDown, tone: "var(--bad)", title: "Reduce reverberation",
-        body: `RT60 is ${rt.toFixed(2)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Add absorption — acoustic panels on reflective walls, heavy curtains, or carpet — to bring it down.` });
+      recs.push({
+        icon: TrendingDown, tone: "var(--bad)", title: "Increase absorption — target NRC",
+        body: plan
+          ? (plan.practical
+              ? `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Over ${f1(plan.V)} m³ the room is short ${f1(plan.dA)} m² sabins. Apply NRC ${plan.practical.nrc.toFixed(2)} over about ${f1(plan.practical.area)} m² of wall or ceiling — ${plan.practical.pct.toFixed(0)}% of the treatable surface — to land at ${f2(plan.aim)} s. Spread across every surface the requirement is only NRC ${plan.nrcFull.toFixed(2)}, which is below anything commercially rated.`
+              : `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Over ${f1(plan.V)} m³ the room is short ${f1(plan.dA)} m² sabins of absorption. Apply a surface rated NRC ${plan.nrcFull.toFixed(2)} across the ${f1(plan.treatable)} m² of wall and ceiling to land at ${f2(plan.aim)} s.`)
+          : `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Room dimensions are needed to compute a required NRC.`,
+        plan, kind: "absorb",
+      });
     } else if (rt < RT60_TARGET.low) {
-      recs.push({ icon: TrendingUp, tone: "var(--sim-dead)", title: "Room is over-damped",
-        body: `RT60 is ${rt.toFixed(2)} s, below the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Remove some absorption or add diffusion to restore liveliness.` });
+      recs.push({
+        icon: TrendingUp, tone: "var(--sim-dead)", title: "Reduce absorption — target NRC",
+        body: plan
+          ? `RT60 is ${f2(rt)} s, below the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. The room is over-absorbing by ${f1(Math.abs(plan.dA))} m² sabins. Bring the treated wall and ceiling surface down to about NRC ${plan.nrcFull.toFixed(2)}, or swap absorptive area for reflective/diffusive area of equivalent size.`
+          : `RT60 is ${f2(rt)} s, below the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Room dimensions are needed to compute a required NRC.`,
+        plan, kind: "reflect",
+      });
     } else {
-      recs.push({ icon: CheckCircle2, tone: "var(--ok)", title: "RT60 within target",
-        body: `RT60 is ${rt.toFixed(2)} s, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} s band. Maintain the current treatment.` });
+      recs.push({
+        icon: CheckCircle2, tone: "var(--ok)", title: "RT60 within target — hold current NRC",
+        body: plan
+          ? `RT60 is ${f2(rt)} s, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} s band. The room's average absorption coefficient is ᾱ ${plan.aBar.toFixed(2)}. Keep any new surface at or near NRC ${plan.aBar.toFixed(2)} so the balance holds.`
+          : `RT60 is ${f2(rt)} s, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} s band.`,
+        plan, kind: "hold",
+      });
     }
   }
-  if (counts.hot > 0) recs.push({ icon: Volume2, tone: "var(--bad)", title: `Treat ${counts.hot} hotspot${counts.hot > 1 ? "s" : ""}`,
-    body: "Reverberant hotspots build up sound energy. Place absorptive material at these locations and on the nearest hard surfaces." });
-  if (counts.dead > 0) recs.push({ icon: Radio, tone: "var(--sim-dead)", title: `Address ${counts.dead} deadspot${counts.dead > 1 ? "s" : ""}`,
-    body: "Dead spots lose coverage. Add a diffuser or reposition a source/speaker so sound reaches these areas more evenly." });
-  if (!recs.length) recs.push({ icon: CheckCircle2, tone: "var(--ok)", title: "No issues detected",
-    body: "The current scan doesn't flag any hotspots or reverberation problems." });
+
+  if (counts.hot > 0) {
+    const localNrc = plan ? Math.max(0.6, Math.min(1, toNrcStep(plan.nrcRaw + 0.1))) : 0.85;
+    recs.push({
+      icon: Volume2, tone: "var(--bad)", title: `${counts.hot} hotspot${counts.hot > 1 ? "s" : ""} — local NRC ${localNrc.toFixed(2)}`,
+      body: `Energy is building up at ${counts.hot === 1 ? "this location" : "these locations"}. Specify a higher local rating — NRC ${localNrc.toFixed(2)} or better — on the two nearest bounding surfaces, rather than spreading the same rating evenly around the room.`,
+    });
+  }
+  if (counts.dead > 0) {
+    recs.push({
+      icon: Radio, tone: "var(--sim-dead)", title: `${counts.dead} deadspot${counts.dead > 1 ? "s" : ""} — cap local NRC at 0.30`,
+      body: `Coverage drops out at ${counts.dead === 1 ? "this location" : "these locations"}. Keep the surrounding surfaces below NRC 0.30 so they stay reflective, or reposition the source. Adding absorption here makes the deadspot worse.`,
+    });
+  }
+  if (!recs.length) {
+    recs.push({ icon: CheckCircle2, tone: "var(--ok)", title: "No issues detected",
+      body: "The current scan doesn't flag any hotspots or reverberation problems." });
+  }
   return recs;
+}
+
+/* Coverage table — the same absorption deficit met by different ratings.
+   Higher NRC means less area to cover; the installer picks the trade-off. */
+function NrcTable({ plan }) {
+  if (!plan || !Math.abs(plan.dA)) return null;
+  const cell = { padding: "6px 10px", textAlign: "right", whiteSpace: "nowrap" };
+  const head = { ...cell, fontWeight: 600, opacity: 0.7, borderBottom: "1px solid rgba(255,255,255,0.10)" };
+  return (
+    <div style={{ marginTop: 12, overflowX: "auto" }}>
+      <table style={{ borderCollapse: "collapse", fontSize: "0.86em", minWidth: 300 }}>
+        <thead>
+          <tr>
+            <th style={{ ...head, textAlign: "left" }}>Rating applied</th>
+            <th style={head}>Area required</th>
+            <th style={head}>Of wall + ceiling</th>
+          </tr>
+        </thead>
+        <tbody>
+          {plan.coverage.map((c) => (
+            <tr key={c.nrc} style={{ opacity: c.ok ? 1 : 0.4 }}>
+              <td style={{ ...cell, textAlign: "left" }}>NRC {c.nrc.toFixed(2)}</td>
+              <td style={cell}>{c.ok ? `${c.area.toFixed(1)} m²` : "not achievable"}</td>
+              <td style={cell}>{c.ok ? `${c.pct.toFixed(0)}%` : "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div style={{ marginTop: 8, fontSize: "0.82em", opacity: 0.65, lineHeight: 1.5 }}>
+        Room volume {plan.V.toFixed(1)} m³ · treatable surface {plan.treatable.toFixed(1)} m² ·
+        current ᾱ {plan.aBar.toFixed(2)} · deficit {plan.dA >= 0 ? "+" : ""}{plan.dA.toFixed(1)} m² sabins.
+        Derived from Sabine (RT60 = 0.161 V / A); floor excluded from treatable area.
+      </div>
+      {!plan.feasible && (
+        <div style={{ marginTop: 8, fontSize: "0.82em", lineHeight: 1.5, padding: "8px 10px", borderRadius: 8, background: "rgba(255,91,82,0.10)", border: "1px solid rgba(255,91,82,0.30)" }}>
+          The required coefficient exceeds NRC 1.00 — full-surface treatment alone cannot reach the target.
+          Add volume-based absorption (bass traps, freestanding baffles) or relax the RT60 target.
+        </div>
+      )}
+    </div>
+  );
 }
 
 function Recommendations({ model, hasModel, counts }) {
@@ -706,7 +985,7 @@ function Recommendations({ model, hasModel, counts }) {
     <section className="rec">
       <div className="rec-head">
         <span className="ic"><Target size={16} color="var(--orange)" /></span>
-        <div><div className="t">Recommendations</div><div className="s">Treatment plan to bring RT60 into target</div></div>
+        <div><div className="t">Recommendations</div><div className="s">Required absorption coefficient (NRC) to bring RT60 into target</div></div>
       </div>
       {!hasModel ? (
         <div className="rec-empty">Deploy a room scan to generate recommendations.</div>
@@ -717,7 +996,11 @@ function Recommendations({ model, hasModel, counts }) {
             return (
               <div key={i} className="rec-cell">
                 <span className="ic"><Icon size={16} color={r.tone} /></span>
-                <div><div className="t">{r.title}</div><div className="n">{r.body}</div></div>
+                <div>
+                  <div className="t">{r.title}</div>
+                  <div className="n">{r.body}</div>
+                  {r.plan && r.kind !== "hold" && <NrcTable plan={r.plan} />}
+                </div>
               </div>
             );
           })}
@@ -730,11 +1013,14 @@ function Recommendations({ model, hasModel, counts }) {
 /* ---- small bits ---- */
 function LayerRow({ tone, label, on, onClick, disabled }) {
   return (
-    <label className={`layer-row${disabled ? " disabled" : ""}`}>
+    <label
+      className={`layer-row${disabled ? " disabled" : ""}`}
+      style={{ fontSize: "0.86em", paddingTop: 5, paddingBottom: 5 }}
+    >
       <input type="checkbox" checked={!!on} onChange={onClick} disabled={disabled} />
-      <span className="layer-box"><svg viewBox="0 0 24 24" fill="none" stroke="#17131f" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6 9 17l-5-5" /></svg></span>
+      <span className="layer-box" style={{ transform: "scale(0.88)" }}><svg viewBox="0 0 24 24" fill="none" stroke="#17131f" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6 9 17l-5-5" /></svg></span>
       <span className={`layer-dot ${tone}`} />
-      <span className="layer-name">{label}</span>
+      <span className="layer-name" style={{ fontSize: "0.94em", fontWeight: 600 }}>{label}</span>
     </label>
   );
 }

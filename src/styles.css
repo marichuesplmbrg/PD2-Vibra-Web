@@ -100,10 +100,15 @@ html, body, #root { height: 100%; margin: 0; }
 .user .u-name { font-size: 14px; font-weight: 600; line-height: 1.2; }
 .user .u-org { font-size: 12px; color: var(--muted); }
 
-.page { padding: 24px 28px 40px; display: flex; flex-direction: column; gap: 18px; }
+/* .page / .pagehead is the Dashboard's layout. The type scale and padding below
+   are kept identical to .vwrap / .vhead further down, so the title sits in the
+   same place and at the same size on every page. Change both together.
+   Note the sub has no bottom margin here: .page is a flex column with an 18px
+   gap, which already supplies the spacing .vhead gets from margin-bottom. */
+.page { padding: 26px 34px 40px; display: flex; flex-direction: column; gap: 18px; }
 .pagehead { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.pagehead h1 { margin: 0; font-size: 26px; font-weight: 800; }
-.pagehead .sub { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+.pagehead h1 { margin: 0 0 4px; font-size: 30px; font-weight: 800; letter-spacing: -.4px; }
+.pagehead .sub { margin: 0; color: var(--muted); font-size: 15px; }
 .export {
   display: flex; align-items: center; gap: 8px; border: 1px solid var(--line);
   background: var(--panel); color: var(--ink); padding: 11px 16px; border-radius: 11px;
@@ -241,6 +246,8 @@ html, body, #root { height: 100%; margin: 0; }
 .main { scrollbar-width: none; -ms-overflow-style: none; }
 .main::-webkit-scrollbar { width: 0; height: 0; }
 
+/* Standard page wrapper + header. .page / .pagehead above mirrors these values
+   for the Dashboard — keep the two in sync. */
 .vwrap { padding: 26px 34px 40px; max-width: 1240px; }
 .vwrap.narrow { max-width: 1000px; }
 .vhead h1 { font-size: 30px; font-weight: 800; margin: 0 0 4px; letter-spacing: -.4px; }
@@ -443,25 +450,26 @@ html, body, #root { height: 100%; margin: 0; }
 @media (max-width: 1080px) { .dash-top { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 720px) { .dash-top { grid-template-columns: 1fr; } }
 
+/* Matches .vwrap / .vhead in this file so the title sits in the same place and
+   at the same size as every other page. Colours use the theme tokens rather
+   than literals, so the page follows the runtime overrides from config.js. */
 .team-page {
   min-height: 100%;
-  padding: 40px;
-  color: #f5f5f5;
-}
-
-.team-header {
-  margin-bottom: 32px;
+  padding: 26px 34px 40px;
+  max-width: 1240px;
+  color: var(--ink);
 }
 
 .team-header h1 {
-  margin: 0 0 10px;
-  font-size: 32px;
-  font-weight: 600;
+  margin: 0 0 4px;
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: -.4px;
 }
 
 .team-header p {
-  margin: 0;
-  color: #9ca3af;
+  margin: 0 0 18px;
+  color: var(--muted);
   font-size: 15px;
 }
 
@@ -472,11 +480,12 @@ html, body, #root { height: 100%; margin: 0; }
   max-width: 1000px;
 }
 
+/* Same treatment as .card / .scan / .hist-card. */
 .team-card {
   overflow: hidden;
-  border: 1px solid #2b3442;
-  border-radius: 8px;
-  background: #111820;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
   transition: transform 0.2s ease, border-color 0.2s ease;
 }
 
@@ -488,7 +497,7 @@ html, body, #root { height: 100%; margin: 0; }
 .member-image {
   height: 220px;
   overflow: hidden;
-  background: #1a222d;
+  background: var(--panel2);
 }
 
 .member-image img {
@@ -498,19 +507,19 @@ html, body, #root { height: 100%; margin: 0; }
 }
 
 .member-info {
-  padding: 16px;
+  padding: 16px 18px;
 }
 
 .member-info h3 {
-  margin: 0 0 6px;
-  font-size: 16px;
-  font-weight: 600;
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 700;
 }
 
 .member-info p {
   margin: 0;
-  color: #9ca3af;
-  font-size: 13px;
+  color: var(--muted);
+  font-size: 13.5px;
 }
 
 @media (max-width: 900px) {
@@ -521,7 +530,7 @@ html, body, #root { height: 100%; margin: 0; }
 
 @media (max-width: 600px) {
   .team-page {
-    padding: 24px;
+    padding: 22px 20px 40px;
   }
 
   .team-grid {
@@ -529,3 +538,4 @@ html, body, #root { height: 100%; margin: 0; }
   }
 }
 .layer-note { margin: 18px 0 0; font-size: 13.5px; color: var(--muted); line-height: 1.55; }
+

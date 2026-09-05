@@ -12,7 +12,12 @@
 const KEY = "vibra.history.v1";
 const RESTORE_KEY = "vibra.history.restore.v1";
 const WORK_KEY = "vibra.work.v1";
-const DEPLOY_KEY = "vibra.deploy.v1";
+// v2: the v1 key was write-only — nothing in the app could ever remove it, so
+// any deployment made during development is still sitting in localStorage and
+// rebuilds the twin on every load. Bumping the key retires those records, and
+// the purge below deletes them outright so they can't be read back.
+const DEPLOY_KEY = "vibra.deploy.v2";
+const LEGACY_DEPLOY_KEYS = ["vibra.deploy.v1"];
 
 const listeners = new Set();        // notified when the saved list changes
 const restoreListeners = new Set(); // notified when a restore is requested
@@ -27,6 +32,13 @@ const canLS = (() => {
   try { const k = "__vibra_t"; localStorage.setItem(k, "1"); localStorage.removeItem(k); return true; }
   catch { return false; }
 })();
+
+// Runs once, at import, before anything can call getDeployment().
+if (canLS) {
+  for (const k of LEGACY_DEPLOY_KEYS) {
+    try { localStorage.removeItem(k); } catch { /* ignore */ }
+  }
+}
 
 function read() {
   if (mem) return mem;
@@ -79,9 +91,13 @@ export const vibraHistory = {
     if (canLS) { try { return JSON.parse(localStorage.getItem(WORK_KEY) || "null"); } catch { return null; } }
     return null;
   },
+  // Clearing the working session also drops the deployment: the Simulation page
+  // is a view of the table's data, so leaving a deployment behind after a reset
+  // would show a twin built from rows that no longer exist anywhere.
   clearWorking() {
     workMem = null;
     if (canLS) { try { localStorage.removeItem(WORK_KEY); } catch { /* ignore */ } }
+    this.clearDeployment();
   },
 
   /* --- deployment (Parameters table -> Simulation page) --- */
@@ -95,5 +111,41 @@ export const vibraHistory = {
     if (canLS) { try { return JSON.parse(localStorage.getItem(DEPLOY_KEY) || "null"); } catch { return null; } }
     return null;
   },
+  // Drop the current deployment and tell the Simulation page to go blank.
+  // Both the in-memory cache and the localStorage mirror must go: clearing only
+  // the cache leaves getDeployment() falling straight through to the stored
+  // copy on the next read, which is why a reset never took effect before.
+  clearDeployment() {
+    deployMem = null;
+    if (canLS) { try { localStorage.removeItem(DEPLOY_KEY); } catch { /* ignore */ } }
+    deployListeners.forEach((f) => f(null));
+  },
+  hasDeployment() { return !!this.getDeployment(); },
+  // One call for a "Reset" control: wipes the working session, the pending
+  // restore handoff and the deployment. Leaves the user's saved scans alone —
+  // use clear() for those.
+  resetSession() {
+    this.clearRestore();
+    this.clearWorking();
+  },
   onDeploy(fn) { deployListeners.add(fn); return () => deployListeners.delete(fn); },
 };
+
+/* Dev escape hatch: from the browser console you can run
+     vibraHistory.getDeployment()   -> see exactly what the twin is built from
+     vibraHistory.clearDeployment() -> blank the Simulation page immediately
+   Useful for telling "stale stored data" apart from "the reset button isn't
+   wired up", which look identical from the UI. */
+if (typeof window !== "undefined") window.vibraHistory = vibraHistory;
+
+/* Keep tabs in sync: if the deployment is cleared or replaced in another tab,
+   mirror it here instead of serving a cached copy that no longer exists. */
+if (canLS && typeof window !== "undefined") {
+  window.addEventListener("storage", (e) => {
+    if (e.key !== DEPLOY_KEY) return;
+    let next = null;
+    try { next = e.newValue ? JSON.parse(e.newValue) : null; } catch { next = null; }
+    deployMem = next;
+    deployListeners.forEach((f) => f(next));
+  });
+}

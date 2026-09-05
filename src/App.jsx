@@ -9,6 +9,7 @@ import HistoryPage from "./pages/HistoryPage.jsx";
 import Simulation from "./pages/Simulation.jsx";
 import Instructions from "./pages/Instructions.jsx";
 import Team from "./pages/Team";
+import Settings from "./pages/Settings.jsx";
 
 export default function App() {
   // Push config colors onto :root so config.js stays the single
@@ -32,6 +33,7 @@ export default function App() {
             <Route path="/simulation" element={<Simulation />} />
             <Route path="/instructions" element={<Instructions />} />
             <Route path="/team" element={<Team />} />
+            <Route path="/settings" element={<Settings />} />
             <Route path="*" element={<Dashboard />} />
           </Routes>
         </main>
