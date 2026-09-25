@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import * as THREE from "three";
-import { Play, Pause, RotateCw, Radio, Target, TrendingDown, TrendingUp, CheckCircle2, Volume2 } from "lucide-react";
+import { Play, Pause, RotateCw, Radio, Target, TrendingDown, TrendingUp, CheckCircle2, Volume2, AlertCircle, AlertTriangle } from "lucide-react";
 import { vibraHistory } from "./vibraHistory";
-import { PROTOTYPE_STL_BASE64 } from "./prototypeModel";
 
 /* Colors come from styles.css tokens (config.js overrides at runtime). This
    reads them so the WebGL materials match the CSS. */
@@ -71,9 +70,30 @@ function glowTexture() {
   return _glowTex;
 }
 
-// Where the prototype STL is served from. Put prototype.stl in your app's
-// /public/models/ folder, or pass a `deviceUrl` prop to override.
-const DEVICE_URL = "/models/prototype.stl";
+// Where the prototype STLs are served from — put both files in your app's
+// /public/models/ folder. `deviceUrl` / `soundDeviceUrl` props override them.
+//   Hardware_1.stl — the default prototype shown in the twin.
+//   Hardware_2.stl — shown instead while the Imbalanced sound layer is on.
+const DEVICE_URLS = { hw1: "/models/Hardware_1.stl", hw2: "/models/Hardware_2.stl" };
+const DEVICE_NAMES = { hw1: "Hardware 1", hw2: "Hardware 2" };
+// Each model is drawn at a real, fixed size in metres — the same units as the
+// room — so the twin shows the prototype at true scale against the walls. The
+// STL is scaled uniformly from its own bounding box, so its units don't matter;
+// one measured dimension is pinned and the rest follow the model's proportions.
+//   pin "long"   — the model's longest side is set to `size`
+//   pin "height" — its vertical extent is set to `size`
+//   Hardware 1 — 7 in (0.1778 m) across its longest side. Measured against the
+//                testbed photo, the box spans ~26% of the 0.64 m room width
+//                (≈0.17 m) and stands ~0.11 m tall, so 7 in is its width, not
+//                its height — pinning height to 7 in drew it ~2× too big.
+//   Hardware 2 — 170 cm tall.
+// `up` names which axis of the loaded model is the device's real vertical
+// (after the Z-up -> Y-up turn in prepareDevice); set "x" or "z" only if the
+// model loads lying down. The console prints each model's extents on load.
+const DEVICE_SPEC = {
+  hw1: { size: 7 * 0.0254, pin: "long", up: "y" },
+  hw2: { size: 1.70, pin: "height", up: "y" },
+};
 
 /* ------------------------------------------------------------------ *
  * Minimal STL loader (binary + ASCII) -> BufferGeometry. Avoids the
@@ -169,9 +189,7 @@ const RX_METRIC = /rt60|reverb|spl|level|db|energy|score|intensity/i;
 const RX_ANGLE = /^\s*(angle|bearing|azimuth|heading|deg)/i;
 
 /* Classification is the tab that owns hot/dead/neutral, so it is searched
-   first. Without this ordering the first tab that merely happens to carry
-   coordinates and a level column wins, and the labels get re-derived from a
-   median split instead of read from the sheet. */
+   first; tabs without a classification column are never used for spots. */
 function rankedTabs(tabs) {
   return Object.entries(tabs || {})
     .map(([name, t]) => ({
@@ -242,30 +260,21 @@ function parseDeployment(dep) {
   else centre(rawPoints);
 
   // --- hot / dead / neutral spots ---
-  // Labels are read from the Classification tab. A median split is only used
-  // when no tab in the bundle carries a class column at all, and the result is
-  // flagged so the UI can say the labels were derived rather than measured.
+  // Spots come ONLY from a tab that carries its own classification column, and
+  // every field of a spot (label, position, level) is read from that same tab
+  // and that same row. Nothing is derived or borrowed: no median split, no
+  // falling back to another tab's columns (e.g. the LiDAR obstacle points),
+  // and a row with a blank label is skipped rather than defaulted. If the
+  // parameters aren't there, the layer stays empty and the audit says why.
   let spots = [];
   let spotsAreBearings = false;
-  let spotsDerived = false;
   let spotsFrom = null;
 
-  const cands = rankedTabs(tabs);
-  const anyClassTab = cands.some((c) => c.classI >= 0);
+  const cands = rankedTabs(tabs).filter((c) => c.classI >= 0);
 
   for (const c of cands) {
-    // Once the bundle is known to carry labels, don't accept a tab without them.
-    if (anyClassTab && c.classI < 0) continue;
-
-    const metricVals = c.metricI >= 0 ? c.rows.map((r) => parseFloat(r[c.metricI])).filter(numish) : [];
-    const sorted = [...metricVals].sort((a, b) => a - b);
-    const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
-
-    const readType = (r) => {
-      if (c.classI >= 0) return classifyLabel(r[c.classI]);
-      const v = parseFloat(r[c.metricI]);
-      return numish(v) && v >= median ? "hot" : "dead";
-    };
+    const hasLabel = (r) => String(r[c.classI] ?? "").trim() !== "";
+    const readType = (r) => classifyLabel(r[c.classI]);
     const readValue = (r) =>
       c.metricI >= 0 && numish(r[c.metricI]) ? parseFloat(r[c.metricI]) : null;
 
@@ -273,13 +282,14 @@ function parseDeployment(dep) {
     if (c.xi >= 0 && c.yi >= 0) {
       const mm = /mm/i.test(String(c.cols[c.xi]));
       const out = c.rows.map((r) => {
+        if (!hasLabel(r)) return null;
         let x = parseFloat(r[c.xi]), z = parseFloat(r[c.yi]);
         if (!numish(x) || !numish(z)) return null;
         if (mm) { x /= 1000; z /= 1000; }
         return { x, z, type: readType(r), value: readValue(r) };
       }).filter(Boolean);
       if (out.length) {
-        spots = out; spotsFrom = c.name; spotsDerived = c.classI < 0;
+        spots = out; spotsFrom = c.name;
         break;
       }
     }
@@ -289,6 +299,7 @@ function parseDeployment(dep) {
     if (c.angleI >= 0 && room.w && room.l) {
       const hx = (room.w / 2) * 0.94, hz = (room.l / 2) * 0.94;
       const out = c.rows.map((r) => {
+        if (!hasLabel(r)) return null;
         const deg = parseFloat(r[c.angleI]);
         if (!numish(deg)) return null;
         const rad = (deg * Math.PI) / 180;
@@ -300,7 +311,7 @@ function parseDeployment(dep) {
         return { x: dx * tt, z: dz * tt, type: readType(r), value: readValue(r), angle: deg };
       }).filter(Boolean);
       if (out.length) {
-        spots = out; spotsFrom = c.name; spotsDerived = c.classI < 0;
+        spots = out; spotsFrom = c.name;
         spotsAreBearings = true;
         break;
       }
@@ -325,7 +336,133 @@ function parseDeployment(dep) {
     }
   }
 
-  return { room, rawPoints, spots, spotsFrom, spotsDerived, rt60, roomTs: dep.roomTs, at: dep.at };
+  return { room, rawPoints, spots, spotsFrom, rt60, roomTs: dep.roomTs, at: dep.at };
+}
+
+/* ================================================================== *
+ * Parameter audit
+ * ------------------------------------------------------------------
+ * parseDeployment answers "can this be drawn?" with a yes or a null.
+ * That is the wrong answer to show a user: a bundle that is missing the
+ * room width and a bundle that was never deployed look identical on
+ * screen, and neither says which parameter to go and fix.
+ *
+ * This walks the same bundle and names what is absent. Errors block a
+ * layer or a calculation outright; warnings change how much the numbers
+ * can be leaned on. Both are reported against the tab they came from.
+ * ================================================================== */
+const rowRef = (list) => {
+  const shown = list.slice(0, 6).map((n) => `row ${n}`).join(", ");
+  return list.length > 6 ? `${shown} +${list.length - 6} more` : shown;
+};
+
+function auditDeployment(dep, model) {
+  const errors = [], warnings = [];
+  const out = (unusable = false) => ({ errors, warnings, unusable });
+  if (!dep) return out();
+
+  const tabs = Object.entries(dep.tabs || {}).map(([name, t]) => ({
+    name: String(name),
+    cols: t?.columns || [],
+    rows: Array.isArray(t?.rows) ? t.rows : [],
+  }));
+
+  if (!tabs.some((t) => t.rows.length)) {
+    errors.push({ title: "Deployed bundle is empty", body: "Every tab in the deployed scan carries zero rows. Re-import the scan in the Parameters table and deploy it again." });
+    return out(true);
+  }
+
+  /* --- room dimensions (LiDAR pass) --- */
+  const d = dep.dims || {};
+  const ok = (v) => numish(v) && +v > 0;
+  const missDims = [];
+  if (!ok(d.width)) missDims.push("width");
+  if (!ok(d.length)) missDims.push("length");
+  if (missDims.length) {
+    errors.push({
+      title: `Missing parameter — room ${missDims.join(" and ")}`,
+      body: `The deployed room row has no usable ${missDims.join(" or ")}. Without a footprint the twin cannot be built and no volume-based figure can be computed. Re-run the LiDAR pass, or pick a room scan whose dimension columns are filled in.`,
+    });
+  }
+  if (!ok(d.height)) {
+    warnings.push({
+      title: "Missing parameter — room height",
+      body: "No height came through with the room row, so the twin, the room volume and every RT60-derived figure assume 2.60 m. Treat the absorption numbers as indicative until a real height is scanned.",
+    });
+  }
+
+  /* --- classification tab --- */
+  const cls =
+    tabs.find((t) => /class/i.test(t.name) && t.rows.length) ||
+    tabs.find((t) => colIdx(t.cols, RX_CLASS) >= 0 && t.rows.length) ||
+    null;
+
+  if (!cls) {
+    errors.push({
+      title: "Missing parameter — no classification data",
+      body: "Nothing in the bundle carries hotspot / neutral / deadspot labels, so the imbalance layer is empty and no placement can be worked out. Publish the Classification tab and deploy again.",
+    });
+  } else {
+    const ci = colIdx(cls.cols, RX_CLASS);
+    const ai = colIdx(cls.cols, RX_ANGLE);
+    const xi = colIdx(cls.cols, RX_X), yi = colIdx(cls.cols, RX_Y);
+    const mi = colIdx(cls.cols, RX_METRIC);
+
+    if (ci < 0) errors.push({ title: `Missing parameter — classification column in “${cls.name}”`, body: "No column names which readings are hotspots, neutral zones or deadspots. Spots are only drawn from labels read off the sheet, so the imbalance layer stays empty." });
+    if (ai < 0 && (xi < 0 || yi < 0)) {
+      errors.push({
+        title: `Missing parameter — position in “${cls.name}”`,
+        body: xi >= 0 || yi >= 0
+          ? `Only ${xi >= 0 ? "X" : "Y"} is present. A reading needs an angle/bearing column, or both X and Y, before it can be placed against a wall.`
+          : "No angle/bearing column and no X + Y pair, so no reading can be placed in the room and the spot layer stays empty.",
+      });
+    }
+    if (mi < 0) warnings.push({ title: `No level column in “${cls.name}”`, body: "There is no RT60 / SPL column alongside the labels, so the coverage area is split evenly between hotspots rather than weighted by how far each reading sits above the room mean." });
+
+    // Blank cells in the columns that do exist.
+    const req = [];
+    if (ci >= 0) req.push({ i: ci, name: cls.cols[ci], num: false });
+    if (ai >= 0) req.push({ i: ai, name: cls.cols[ai], num: true });
+    else { if (xi >= 0) req.push({ i: xi, name: cls.cols[xi], num: true }); if (yi >= 0) req.push({ i: yi, name: cls.cols[yi], num: true }); }
+    if (mi >= 0) req.push({ i: mi, name: cls.cols[mi], num: true });
+
+    const blanks = new Map(), bad = new Map();
+    cls.rows.forEach((r, ri) => {
+      const line = ri + 2; // header row + 1-based
+      req.forEach(({ i, name, num }) => {
+        const v = r[i];
+        if (v === "" || v == null) { if (!blanks.has(name)) blanks.set(name, []); blanks.get(name).push(line); }
+        else if (num && !numish(v)) { if (!bad.has(name)) bad.set(name, []); bad.get(name).push(line); }
+      });
+    });
+    blanks.forEach((list, name) => errors.push({
+      title: `Missing parameter — “${name}” is blank`,
+      body: `${list.length} of ${cls.rows.length} rows in “${cls.name}” have no value for “${name}” (${rowRef(list)}). Those readings are dropped from the twin.`,
+    }));
+    bad.forEach((list, name) => errors.push({
+      title: `Invalid parameter — “${name}” is not numeric`,
+      body: `${list.length} row${list.length > 1 ? "s" : ""} in “${cls.name}” hold a non-numeric value for “${name}” (${rowRef(list)}). Those readings are dropped from the twin.`,
+    }));
+  }
+
+  /* --- reverberation --- */
+  const hasRt60Col = tabs.some((t) => colIdx(t.cols, /rt60/i) >= 0 && t.rows.length);
+  if (!model || !numish(model.rt60)) {
+    errors.push({
+      title: "Missing parameter — RT60",
+      body: hasRt60Col
+        ? "An RT60 column was found but none of its cells hold a usable number, so no absorption target can be solved. Re-run the sound-sensor pass."
+        : "No reverberation column came through with the bundle. Sabine needs a measured RT60 before any required αw or coverage area can be worked out — the recommendations below cannot be computed without it.",
+    });
+  }
+
+  /* --- derived model results --- */
+  if (model) {
+    if (!model.spots.length && cls) warnings.push({ title: "No spots placed", body: `The classification data was found in “${cls.name}” but no row survived parsing, so the imbalance layer is empty. Check the position and label columns above.` });
+    if (!model.rawPoints.length) warnings.push({ title: "No obstacle points", body: "Nothing in the bundle carries an X/Y point cloud, so the room draws as a bare box with no detected edges inside it. The LiDAR obstacle pass may not have been included." });
+  }
+
+  return out(missDims.length > 0);
 }
 
 function centre(pts) {
@@ -351,68 +488,62 @@ function fitInside(pts, w, l, mode, inset = 0.95) {
 }
 
 /* ================================================================== */
-export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
+// Fetch one STL. No substitute model on failure — a missing file is reported,
+// not silently replaced with a different prototype.
+async function loadDevice(url) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return { geo: null, status: "error", why: `HTTP ${r.status}` };
+    if (/text\/html/i.test(r.headers.get("content-type") || "")) return { geo: null, status: "error", why: "server returned HTML, not a model" };
+    const geo = safeParseDevice(await r.arrayBuffer());
+    return geo ? { geo, status: "ready" } : { geo: null, status: "error", why: "not a valid STL" };
+  } catch (err) {
+    return { geo: null, status: "error", why: err.message };
+  }
+}
+
+export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = false } = {}) {
   const [dep, setDep] = useState(() => vibraHistory.getDeployment());
   const [orbiting, setOrbiting] = useState(true);
-  const [layers, setLayers] = useState({ shell: true, edges: true, raw: true, spots: true, omni: true, device: true });
+  // Default view: only the room shell and its raw points; everything else is opt-in.
+  const [layers, setLayers] = useState({ shell: true, edges: false, raw: true, spots: false, omni: false, device: false });
   const [hover, setHover] = useState(null);
-  const [deviceGeo, setDeviceGeo] = useState(null);
-  const [deviceStatus, setDeviceStatus] = useState("idle"); // idle|loading|ready|error
-  const deviceHref = deviceUrl || DEVICE_URL;
+  const hrefs = { hw1: deviceUrl || DEVICE_URLS.hw1, hw2: soundDeviceUrl || DEVICE_URLS.hw2 };
+  const [devices, setDevices] = useState({ hw1: { geo: null, status: "loading" }, hw2: { geo: null, status: "loading" } });
+  // Which prototype the twin shows: Hardware 2 while Imbalanced sound is on
+  // (and its file loaded), otherwise Hardware 1.
+  const activeDevice = layers.spots && devices.hw2.geo ? "hw2" : "hw1";
+  const active = devices[activeDevice];
 
   // A cleared deployment arrives as null. Wrap the setter so React never
   // mistakes a payload for a functional state update.
   useEffect(() => vibraHistory.onDeploy((payload) => setDep(payload ?? null)), []);
 
-  // Load the prototype model. Try to fetch a served STL first (so you can swap
-  // the file without a rebuild); if none is reachable — or the server returns an
-  // HTML SPA-fallback with 200 — fall back to the model bundled with the app so
-  // the device always renders.
+  // Load both prototype models once; the scene holds both and the layer
+  // state decides which one is visible.
   useEffect(() => {
     let alive = true;
-    setDeviceStatus("loading");
-    const candidates = [deviceHref, "/models/prototype.stl", "/models/Protoype-stripped.stl", "/prototype.stl"]
-      .filter((u, i, a) => u && a.indexOf(u) === i);
-    (async () => {
-      const tried = [];
-      for (const url of candidates) {
-        try {
-          const r = await fetch(url);
-          if (!r.ok) { tried.push(`${url} (HTTP ${r.status})`); continue; }
-          const ct = r.headers.get("content-type") || "";
-          if (/text\/html/i.test(ct)) { tried.push(`${url} (server returned HTML, not a model)`); continue; }
-          const geo = safeParseDevice(await r.arrayBuffer());
-          if (!geo) { tried.push(`${url} (not a valid STL)`); continue; }
-          if (!alive) return;
-          setDeviceGeo(geo); setDeviceStatus("ready"); return;
-        } catch (err) { tried.push(`${url} (${err.message})`); }
-      }
-      // fall back to the embedded model
-      try {
-        const geo = safeParseDevice(b64ToArrayBuffer(PROTOTYPE_STL_BASE64));
-        if (geo) {
-          if (!alive) return;
-          setDeviceGeo(geo); setDeviceStatus("ready");
-          if (tried.length) console.info("[VIBRA] Using embedded prototype model (no served STL found). Tried:\n  " + tried.join("\n  "));
-          return;
-        }
-        tried.push("embedded model (empty)");
-      } catch (err) { tried.push(`embedded model (${err.message})`); }
+    ["hw1", "hw2"].forEach(async (k) => {
+      const res = await loadDevice(hrefs[k]);
       if (!alive) return;
-      setDeviceStatus("error");
-      console.warn("[VIBRA] Prototype model not loaded. Tried:\n  " + tried.join("\n  "));
-    })();
+      if (res.status === "error") console.warn(`[VIBRA] ${DEVICE_NAMES[k]} not loaded from ${hrefs[k]} (${res.why}).`);
+      setDevices((d) => ({ ...d, [k]: res }));
+    });
     return () => { alive = false; };
-  }, [deviceHref]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hrefs.hw1, hrefs.hw2]);
 
   const model = useMemo(() => parseDeployment(dep), [dep]);
   // Nothing is drawn — and the canvas isn't even mounted — until a scan lands.
   const hasModel = !!(model && model.room.w && model.room.l);
+  // What the bundle is missing, named per parameter. Computed whether or not
+  // the model parsed, because the interesting case is the one where it didn't.
+  const audit = useMemo(() => auditDeployment(dep, model), [dep, model]);
 
   const mountRef = useRef(null);
   const three = useRef(null);
   const spotsRef = useRef([]); // pickable spot meshes for hover
-  const orbit = useRef({ theta: Math.PI * 0.28, phi: Math.PI * 0.34, radius: 12, target: new THREE.Vector3(0, 1, 0) });
+  const orbit = useRef({ theta: Math.PI * 0.28, phi: Math.PI * 0.34, radius: 12, home: 12, target: new THREE.Vector3(0, 1, 0) });
   const autoRef = useRef(true);
   useEffect(() => { autoRef.current = orbiting; }, [orbiting]);
 
@@ -422,7 +553,7 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
     if (!mount) return;
     const w = mount.clientWidth || 600, h = mount.clientHeight || 400;
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(46, w / h, 0.1, 1000);
+    const camera = new THREE.PerspectiveCamera(46, w / h, 0.01, 1000); // near plane small enough for sub-metre rooms
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(w, h);
@@ -461,7 +592,18 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
     const down = (e) => { dragging = true; lx = e.clientX; ly = e.clientY; dom.style.cursor = "grabbing"; };
     const move = (e) => { if (!dragging) return; orb.theta -= (e.clientX - lx) * 0.008; orb.phi = Math.max(0.12, Math.min(Math.PI - 0.12, orb.phi - (e.clientY - ly) * 0.008)); lx = e.clientX; ly = e.clientY; setCam(); };
     const up = () => { dragging = false; dom.style.cursor = "grab"; };
-    const wheel = (e) => { e.preventDefault(); orb.radius = Math.max(3, Math.min(45, orb.radius + Math.sign(e.deltaY) * 0.9)); setCam(); };
+    // Zoom limits and step are relative to the fitted view (orb.home), not fixed
+    // metres: a fixed floor of 3 m sat above the default distance for a small
+    // room, so once zoomed out the view could never return to it. Multiplicative
+    // steps keep the zoom feeling the same at any room size.
+    const ZOOM_IN = 0.3, ZOOM_OUT = 5, ZOOM_STEP = 1.12;
+    const wheel = (e) => {
+      e.preventDefault();
+      const home = orb.home || orb.radius;
+      const next = orb.radius * (e.deltaY > 0 ? ZOOM_STEP : 1 / ZOOM_STEP);
+      orb.radius = Math.max(home * ZOOM_IN, Math.min(home * ZOOM_OUT, next));
+      setCam();
+    };
     dom.addEventListener("pointerdown", down);
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
@@ -575,15 +717,22 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
     const f2 = (n) => Number(n).toFixed(2);
     const addLabel = (sp, x, y, z) => { sp.position.set(x, y, z); shell.add(sp); };
 
+    // Annotation scale. Every ruler / cardinal size below was tuned for a room
+    // about 4 m across (k = 1). k follows the room's largest dimension, so a
+    // 0.6 m enclosure gets proportionally small labels, offsets and ticks and a
+    // 10 m hall gets proportionally larger ones — the annotations keep the same
+    // size relative to the room no matter what was scanned.
+    const k = Math.max(0.05, Math.max(w, l, h) / 4);
+
     // ---- dimension rulers (width / length / height) ----
     // Text tier is a bit smaller than the cardinal directions below.
-    const dimStyle = { fg: "#d8fff0", worldH: 0.26, accent: COL.dim };
+    const dimStyle = { fg: "#d8fff0", worldH: 0.26 * k, accent: COL.dim };
     const rulerMat = new THREE.LineBasicMaterial({ color: new THREE.Color(COL.dim), transparent: true, opacity: 0.85 });
     const seg = (ax, ay, az, bx, by, bz) =>
       shell.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(ax, ay, az), new THREE.Vector3(bx, by, bz)]), rulerMat));
-    const rOff = Math.max(0.28, Math.max(w, l) * 0.08); // how far rulers sit outside the room
-    const tick = Math.max(0.06, Math.min(w, l) * 0.06); // end-cap length
-    const y0 = 0.02;
+    const rOff = Math.max(0.28 * k, Math.max(w, l) * 0.08); // how far rulers sit outside the room
+    const tick = Math.max(0.06 * k, Math.min(w, l) * 0.06); // end-cap length
+    const y0 = 0.02 * k;
 
     // Width — along X, in front of the room (+Z side)
     {
@@ -593,7 +742,7 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
       seg(-w / 2, y0, z, w / 2, y0, z);       // dimension line
       seg(-w / 2, y0, z - tick, -w / 2, y0, z + tick); // end ticks
       seg(w / 2, y0, z - tick, w / 2, y0, z + tick);
-      addLabel(makeLabel(`Width ${f2(w)} m`, dimStyle), 0, y0, z + tick + 0.14);
+      addLabel(makeLabel(`Width ${f2(w)} m`, dimStyle), 0, y0, z + tick + 0.14 * k);
     }
     // Length — along Z, on the right of the room (+X side)
     {
@@ -603,7 +752,7 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
       seg(x, y0, -l / 2, x, y0, l / 2);
       seg(x - tick, y0, -l / 2, x + tick, y0, -l / 2);
       seg(x - tick, y0, l / 2, x + tick, y0, l / 2);
-      addLabel(makeLabel(`Length ${f2(l)} m`, dimStyle), x + tick + 0.14, y0, 0);
+      addLabel(makeLabel(`Length ${f2(l)} m`, dimStyle), x + tick + 0.14 * k, y0, 0);
     }
     // Height — vertical, at the back-left corner
     {
@@ -613,18 +762,18 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
       seg(x, 0, z, x, h, z);                   // dimension line
       seg(x - tick, 0, z, x + tick, 0, z);     // end ticks
       seg(x - tick, h, z, x + tick, h, z);
-      addLabel(makeLabel(`Height ${f2(h)} m`, dimStyle), x - tick - 0.16, h / 2, z);
+      addLabel(makeLabel(`Height ${f2(h)} m`, dimStyle), x - tick - 0.16 * k, h / 2, z);
     }
 
     // ---- cardinal directions — bigger, and set farther out from the room ----
-    const cardStyle = { fg: "#fff4d6", worldH: 0.38, accent: COL.card };
-    const cOff = Math.max(1.5, Math.max(w, l) * 0.35);
-    const cy = 0.05;
+    const cardStyle = { fg: "#fff4d6", worldH: 0.38 * k, accent: COL.card };
+    const cOff = Math.max(1.5 * k, Math.max(w, l) * 0.35);
+    const cy = 0.05 * k;
     // Short amber pointer strokes on the floor tie each pill to its bearing.
     const cardMat = new THREE.LineBasicMaterial({ color: new THREE.Color(COL.card), transparent: true, opacity: 0.6 });
     const cardSeg = (ax, az, bx, bz) =>
-      shell.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(ax, 0.02, az), new THREE.Vector3(bx, 0.02, bz)]), cardMat));
-    const cTick = Math.max(0.18, cOff * 0.22);
+      shell.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(ax, y0, az), new THREE.Vector3(bx, y0, bz)]), cardMat));
+    const cTick = Math.max(0.18 * k, cOff * 0.22);
     cardSeg(0, -l / 2 - cOff + cTick, 0, -l / 2 - cOff - cTick * 0.2);
     cardSeg(w / 2 + cOff - cTick, 0, w / 2 + cOff + cTick * 0.2, 0);
     cardSeg(0, l / 2 + cOff - cTick, 0, l / 2 + cOff + cTick * 0.2);
@@ -660,6 +809,22 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
     if (model.spots.length) {
       const spotGroup = new THREE.Group();
       const y = Math.min(1.2, h * 0.5);
+
+      // Marker size follows the room's physical scale instead of a fixed 0.15 m.
+      // Base: 7 % of the smallest room dimension (≈0.21 m in a 3 m room).
+      // Cap: 45 % of the tightest spacing between spots, so neighbouring
+      // readings stay distinct instead of merging into one blob.
+      const minDim = Math.max(0.05, Math.min(w, l, h));
+      let nearest = Infinity;
+      for (let i = 0; i < model.spots.length; i++) {
+        for (let j = i + 1; j < model.spots.length; j++) {
+          const d = Math.hypot(model.spots[i].x - model.spots[j].x, model.spots[i].z - model.spots[j].z);
+          if (d > 1e-4 && d < nearest) nearest = d;
+        }
+      }
+      const coreR = Math.max(0.004, Math.min(minDim * 0.07, Number.isFinite(nearest) ? nearest * 0.45 : Infinity));
+      const glowS = coreR * 6.3;   // keeps the old 0.15 : 0.95 core-to-glow ratio
+      const hitR = coreR * 2.3;    // keeps the old 0.15 : 0.34 pick-target ratio
       model.spots.forEach((s) => {
         const col = s.type === "hot" ? COL.hot : s.type === "neutral" ? COL.neutral : COL.dead;
         const info = { type: s.type, value: s.value, x: s.x, z: s.z, angle: s.angle };
@@ -668,7 +833,7 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
         // the sprite behind it, not by over-driving the surface.
         const solid = new THREE.Color(col).multiplyScalar(0.82);
         const core = new THREE.Mesh(
-          new THREE.SphereGeometry(0.15, 24, 18),
+          new THREE.SphereGeometry(coreR, 24, 18),
           new THREE.MeshStandardMaterial({
             color: solid, emissive: solid, emissiveIntensity: 0.16,
             roughness: 0.55, metalness: 0.0,
@@ -683,12 +848,12 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
           blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.9,
         }));
         glow.position.copy(core.position);
-        glow.scale.set(0.95, 0.95, 1);
+        glow.scale.set(glowS, glowS, 1);
         glow.renderOrder = 5;
 
         // Invisible but pickable, so hover keeps the old generous target size.
         const hit = new THREE.Mesh(
-          new THREE.SphereGeometry(0.34, 12, 10),
+          new THREE.SphereGeometry(hitR, 12, 10),
           new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false })
         );
         hit.position.copy(core.position); hit.userData = info;
@@ -746,16 +911,32 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
       content.add(omni); groups.omni = omni;
     }
 
-    // prototype device — fixed at the room centre on the floor
-    if (deviceGeo) {
-      const geo = deviceGeo.clone();
+    // prototype devices — each at its fixed real size (see DEVICE_SPEC),
+    // placed at the room centre, standing on the floor. applyLayers shows one.
+    const heights = {};
+    const buildDevice = (src, key) => {
+      const spec = DEVICE_SPEC[key];
+      const geo = src.clone();
+      if (spec.up === "x") geo.rotateZ(Math.PI / 2);   // model X -> vertical
+      // +90° about X undoes prepareDevice's −90° turn (model −Z -> +Y), so a
+      // Y-up export stands upright instead of flipping upside down.
+      if (spec.up === "z") geo.rotateX(Math.PI / 2);   // model Z -> vertical
       geo.computeBoundingBox();
       const bb = geo.boundingBox;
-      const devH = (bb.max.y - bb.min.y) || 1;         // model height in metres
+      const devH = (bb.max.y - bb.min.y) || 1;
       const devFoot = Math.max(bb.max.x - bb.min.x, bb.max.z - bb.min.z) || 1;
-      // scale so the prototype stands exactly 1.60 m tall (uniform, keeps shape)
-      const DEVICE_HEIGHT_M = 1.6;
-      const s = DEVICE_HEIGHT_M / devH;
+      const devLong = Math.max(devH, bb.max.x - bb.min.x, bb.max.z - bb.min.z) || 1;
+      const s = spec.size / (spec.pin === "long" ? devLong : devH);
+      heights[key] = devH * s; // real standing height, used to frame the camera
+      const ext = (v) => (v * 1000).toFixed(0);
+      console.info(
+        `[VIBRA] ${DEVICE_NAMES[key]} STL extents (mm, as loaded): ` +
+        `x ${ext(bb.max.x - bb.min.x)} · y ${ext(devH)} · z ${ext(bb.max.z - bb.min.z)} — ` +
+        `${spec.pin === "long" ? "longest side" : "height"} pinned to ${ext(spec.size)} mm, ` +
+        `drawn ${ext(devH * s)} mm tall, scale ×${s.toFixed(3)}`
+      );
+      // centre on x/z and sit the base on the floor, measured on the model itself
+      geo.translate(-(bb.min.x + bb.max.x) / 2, -bb.min.y, -(bb.min.z + bb.max.z) / 2);
       const g = new THREE.Group();
       const mat = new THREE.MeshStandardMaterial({
         color: COL.device, metalness: 0.25, roughness: 0.5,
@@ -764,28 +945,48 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
       });
       const mesh = new THREE.Mesh(geo, mat);
       mesh.scale.setScalar(s);
-      // floor marker ring so the device's location always reads
-      const rr = devFoot * s * 0.65;
+      // floor marker ring, just outside the device's footprint — at 0.65 × the
+      // longest side it drew a disc wider than the device and read as part of it.
+      const rr = devFoot * s * 0.5 * 1.15;
       const ring = new THREE.Mesh(
         new THREE.RingGeometry(rr * 0.88, rr, 40),
         new THREE.MeshBasicMaterial({ color: COL.device, transparent: true, opacity: 0.55, side: THREE.DoubleSide })
       );
-      ring.rotation.x = -Math.PI / 2; ring.position.y = 0.02;
+      ring.rotation.x = -Math.PI / 2; ring.position.y = Math.min(0.02, h * 0.01);
       g.add(mesh, ring);
-      g.position.set(0, 0, 0);
-      content.add(g); groups.device = g;
-    }
+      g.position.set(0, 0, 0); // room centre
+      content.add(g);
+      return g;
+    };
+    if (devices.hw1.geo) groups.device1 = buildDevice(devices.hw1.geo, "hw1");
+    if (devices.hw2.geo) groups.device2 = buildDevice(devices.hw2.geo, "hw2");
 
     // frame the camera so the room fills the view (does NOT change room size —
-    // only the camera distance). Based on the room's bounding sphere + the FOV.
-    const orb = orbit.current;
-    orb.target.set(0, h / 2, 0);
-    const fov = ((T.camera && T.camera.fov) || 46) * Math.PI / 180;
-    const sphere = Math.hypot(w, h, l) / 2;        // room bounding-sphere radius
-    orb.radius = (sphere / Math.tan(fov / 2)) * 1.25; // 1.25 = small margin for labels
+    // only the camera distance). Based on the bounding sphere + the FOV.
+    // Only the prototype actually on screen counts: framing for Hardware 2's
+    // 1.70 m while Hardware 1 was showing pushed a 0.6 m room to the bottom
+    // edge of the canvas and cut it off.
+    T.fit = (deviceKey) => {
+      const devTop = deviceKey ? heights[deviceKey] || 0 : 0;
+      const frameH = Math.max(h, devTop);
+      const orb = orbit.current;
+      orb.target.set(0, frameH / 2, 0);
+      const fov = ((T.camera && T.camera.fov) || 46) * Math.PI / 180;
+      const sphere = Math.hypot(w, frameH, l) / 2;   // bounding-sphere radius
+      orb.home = (sphere / Math.tan(fov / 2)) * 1.25; // 1.25 = small margin for labels
+      orb.radius = orb.home;
+    };
+    T.fit(layers.device ? activeDevice : null);
 
     applyLayers(groups, layers);
-  }, [model, deviceGeo]);
+  }, [model, devices.hw1.geo, devices.hw2.geo]);
+
+  /* re-frame when the prototype on screen changes (toggled, or swapped
+     between Hardware 1 and 2) — the rebuild above doesn't run for that */
+  useEffect(() => {
+    const T = three.current;
+    if (T && T.fit) T.fit(layers.device ? activeDevice : null);
+  }, [activeDevice, layers.device]);
 
   /* toggle layer visibility without rebuilding */
   useEffect(() => { if (three.current) applyLayers(three.current.groups, layers); }, [layers]);
@@ -807,11 +1008,19 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
       <div className="sim-mount" style={{ position: "absolute", inset: 0 }}>
         <div ref={mountRef} className="sim-holder" />
         {!hasModel && (
-          <div className="sim-empty">
-            <Radio size={26} color="var(--faint)" />
-            <div className="big">Nothing deployed yet.</div>
-            <div className="small">Deploy a room scan from the Parameters table.</div>
-          </div>
+          audit.unusable ? (
+            <div className="sim-empty">
+              <AlertCircle size={26} color="var(--bad)" />
+              <div className="big">Missing parameter.</div>
+              <div className="small">{audit.errors[0]?.body || "The deployed scan is incomplete."}</div>
+            </div>
+          ) : (
+            <div className="sim-empty">
+              <Radio size={26} color="var(--faint)" />
+              <div className="big">Nothing deployed yet.</div>
+              <div className="small">Deploy a room scan from the Parameters table.</div>
+            </div>
+          )
         )}
         {hasModel && <div className="sim-hint2">drag to orbit · scroll to zoom</div>}
         {hover && (
@@ -833,17 +1042,25 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
      recommendations table: an empty scaffold reads as broken, and the disabled
      checkboxes suggested state that does not exist yet. */
   if (!hasModel) {
+    // A scan WAS deployed but can't be drawn — that is a data fault, not an
+    // empty page, and it gets named rather than hidden behind "nothing yet".
+    const blocked = !!dep && (audit.errors.length > 0 || audit.warnings.length > 0);
     return (
       <div className="vwrap">
         <div className="vhead">
           <h1>Simulation</h1>
-          <p className="sub">Deploy a room scan to build the twin</p>
+          <p className="sub">{blocked ? "Deployed scan is incomplete" : "Deploy a room scan to build the twin"}</p>
         </div>
+        {blocked && <IssuePanel errors={audit.errors} warnings={audit.warnings} />}
         <section className="sim-livebox" style={{ minHeight: 320, display: "flex", alignItems: "center", justifyContent: "center" }}>
           <div className="sim-empty" style={{ position: "static", textAlign: "center", padding: 24 }}>
-            <Radio size={26} color="var(--faint)" />
-            <div className="big">Nothing deployed yet.</div>
-            <div className="small">Open the Parameters table, pick a room scan, and press <b className="ink">Deploy to Simulation</b>.</div>
+            {blocked ? <AlertCircle size={26} color="var(--bad)" /> : <Radio size={26} color="var(--faint)" />}
+            <div className="big">{blocked ? "Twin can't be built." : "Nothing deployed yet."}</div>
+            <div className="small">
+              {blocked
+                ? <>Fill in the parameters listed above in the <b className="ink">Parameters table</b>, then deploy the scan again.</>
+                : <>Open the Parameters table, pick a room scan, and press <b className="ink">Deploy to Simulation</b>.</>}
+            </div>
           </div>
         </section>
       </div>
@@ -856,6 +1073,8 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
         <h1>Simulation</h1>
         <p className="sub">{`Live scan${model.roomTs ? ` · ${model.roomTs}` : ""}`}</p>
       </div>
+
+      <IssuePanel errors={audit.errors} warnings={audit.warnings} />
 
       <div className="sim-boxes">
         {/* 3D box */}
@@ -895,10 +1114,9 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
             <LayerRow tone="edge" label="Detected edges" on={layers.edges} onClick={() => toggle("edges")} disabled={!hasModel} />
             <LayerRow tone="raw" label={`Raw points${model?.rawPoints?.length ? ` (${model.rawPoints.length})` : ""}`} on={layers.raw} onClick={() => toggle("raw")} disabled={!hasModel || !model?.rawPoints?.length} />
             <LayerRow tone="hot" label={`Imbalanced sound${model?.spots?.length ? ` (${counts.hot} hot / ${counts.dead} dead / ${counts.neutral} neutral)` : ""}`} on={layers.spots} onClick={() => toggle("spots")} disabled={!hasModel || !model?.spots?.length} />
-            <LayerRow tone="cyan" label="Omnidirectional sensor" on={layers.omni} onClick={() => toggle("omni")} disabled={!hasModel} />
             <LayerRow tone="device"
-              label={deviceStatus === "error" ? "Prototype — file not found" : deviceStatus === "loading" ? "Prototype — loading…" : "Prototype (device)"}
-              on={layers.device} onClick={() => toggle("device")} disabled={!hasModel || !deviceGeo} />
+              label={active.status === "error" ? `Prototype — ${DEVICE_NAMES[activeDevice]} not found` : active.status === "loading" ? "Prototype — loading…" : `Prototype (${DEVICE_NAMES[activeDevice]})`}
+              on={layers.device} onClick={() => toggle("device")} disabled={!hasModel || !active.geo} />
           </div>
           <div
             className="layer-note"
@@ -914,22 +1132,12 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
               Bearing-only scans are projected onto the wall each reading faced, so a marker shows
               the direction measured, not a localised sound source.
             </div>
-            {hasModel && !model?.spots?.length && (
+            {/* The empty-spot case is reported by the parameter panel above the
+                boxes, where it can name the column that is actually missing —
+                repeating a vaguer version of it here would just compete. */}
+            {["hw1", "hw2"].filter((k) => devices[k].status === "error").map((k) => (
               <div
-                className="warn"
-                style={{
-                  margin: 0, padding: "10px 12px", borderRadius: 8,
-                  background: "rgba(246,161,92,0.10)",
-                  border: "1px solid rgba(246,161,92,0.30)",
-                  lineHeight: 1.55, overflowWrap: "anywhere", hyphens: "auto",
-                }}
-              >
-                <b>No spots.</b> The deployed acoustic scan needs either x/y columns or an
-                <code> angle</code> column, plus a classification or RT60 metric.
-              </div>
-            )}
-            {deviceStatus === "error" && (
-              <div
+                key={k}
                 className="warn"
                 style={{
                   margin: 0, padding: "10px 12px", borderRadius: 8,
@@ -938,9 +1146,10 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
                   lineHeight: 1.55, overflowWrap: "anywhere", hyphens: "auto",
                 }}
               >
-                Prototype not found at “{deviceHref}”.
+                {DEVICE_NAMES[k]} not found at “{hrefs[k]}”.
+                {k === "hw2" ? " Hardware 1 is shown with Imbalanced sound instead." : ""}
               </div>
-            )}
+            ))}
           </div>
           <div style={{ flex: "1 1 auto" }} />
         </section>
@@ -965,18 +1174,43 @@ export default function SimulationPage({ deviceUrl, twinOnly = false } = {}) {
 }
 
 /* ---- recommendations ---- *
- * The plan is expressed as a REQUIRED NRC, not as a named product. We solve
- * Sabine's equation for the absorption the room is missing, then divide that
- * deficit by the surface available to treat. The result is a coefficient the
- * installer can shop against, whatever material they end up buying.
+ * The plan is expressed as a REQUIRED weighted sound absorption coefficient
+ * (αw, ISO 11654:1997) and the matching sound absorption class from its
+ * Annex B — not as a named product. We solve Sabine's equation for the
+ * absorption the room is missing, then divide that deficit by the surface
+ * available to treat. The result is a rating the installer can shop against,
+ * whatever material they end up buying.
  *
  *   RT60 = 0.161 · V / A          (metric Sabine)
  *   A    = 0.161 · V / RT60       -> total absorption, in m² sabins
  *   ΔA   = A_target − A_current   -> what the room is short by
- *   NRC  = ᾱ_current + ΔA / S_treated
+ *   αw   = ᾱ_current + ΔA / S_treated
  * ------------------------------------------------------------------ */
 const SABINE_K = 0.161;
-const NRC_CATALOGUE = [0.55, 0.70, 0.85, 1.00]; // common commercial ratings
+
+/* ISO 11654:1997 Annex B (informative) — sound absorption classes. `min` is
+   the lowest αw inside each class, so sizing coverage at `min` guarantees any
+   product carrying that class meets the area figure. */
+const ISO_CLASSES = [
+  { cls: "A", min: 0.90, label: "Extremely absorbing" },
+  { cls: "B", min: 0.80, label: "Extremely absorbing" },
+  { cls: "C", min: 0.60, label: "Highly absorbing" },
+  { cls: "D", min: 0.30, label: "Absorbing" },
+  { cls: "E", min: 0.15, label: "Hardly absorbing" },
+];
+// Classes an absorption plan can be met with, cheapest (lowest) first. Class E
+// is "hardly absorbing" and is not offered as treatment.
+const TREATMENT_CLASSES = ISO_CLASSES.filter((c) => c.min >= 0.30).slice().reverse();
+
+function isoClassOf(aw) {
+  const hit = ISO_CLASSES.find((c) => aw >= c.min - 1e-9);
+  return hit ? hit.cls : "Not classified";
+}
+// "αw 0.60 (Class C)" — the form used in every card and table below.
+const awText = (aw) => {
+  const c = isoClassOf(aw);
+  return `αw ${aw.toFixed(2)} (${c === "Not classified" ? "not classified" : `Class ${c}`})`;
+};
 
 function roomGeometry(room) {
   const w = room.w, l = room.l, h = room.h || 2.6;
@@ -986,9 +1220,10 @@ function roomGeometry(room) {
   return { w, l, h, V: w * l * h, walls, ceiling, floor, total: walls + ceiling + floor };
 }
 
-// Round to the nearest 0.05 — finer than that is meaningless against published
-// NRC ratings, which are themselves quantised to 0.05.
-const toNrcStep = (v) => Math.round(v * 20) / 20;
+// ISO 11654 §4.1–4.2 quantises αw to steps of 0.05. A *required* value is a
+// minimum, so it is rounded UP to the next step — rounding to nearest could
+// specify a product that falls just short of the target.
+const toAwStep = (v) => Math.ceil(v * 20 - 1e-9) / 20;
 
 /* Sabine assumes a lightly damped, diffuse field. Past ᾱ ≈ 0.2 it overstates
    the absorption present, so switch to Eyring for the same measured RT60. */
@@ -1015,23 +1250,24 @@ function acousticPlan(room, rt60) {
   // Floor is left out of the treatable area — it carries furniture and traffic,
   // so walls + ceiling is what a real install can actually reach.
   const treatable = g.walls + g.ceiling;
-  const nrcRaw = aBar + dA / treatable;
-  const nrcFull = Math.max(0, Math.min(1, toNrcStep(nrcRaw)));
-  const feasible = nrcRaw <= 1.0;
+  const awRaw = aBar + dA / treatable;
+  const awFull = Math.max(0, Math.min(1, toAwStep(awRaw)));
+  const feasible = awRaw <= 1.0;
 
-  // Partial coverage: how much area each catalogue rating would have to cover.
-  const coverage = NRC_CATALOGUE.map((nrc) => {
-    const gain = nrc - aBar;                 // net absorption gained per m²
+  // Partial coverage: how much area each ISO class would have to cover, sized
+  // at the class's lowest αw.
+  const coverage = TREATMENT_CLASSES.map(({ cls, min, label }) => {
+    const gain = min - aBar;                 // net absorption gained per m²
     const area = gain > 0 ? dA / gain : Infinity;
-    return { nrc, area, pct: (area / treatable) * 100, ok: area > 0 && area <= treatable };
+    return { cls, aw: min, label, area, pct: (area / treatable) * 100, ok: area > 0 && area <= treatable };
   });
 
-  // A full-surface answer below ~0.35 is real but unbuyable — nobody stocks an
-  // NRC 0.15 panel. In that case the honest recommendation is a normal rating
-  // over a small area, so pick the lowest catalogue rating that fits.
-  const practical = nrcFull < 0.35 ? coverage.find((c) => c.ok) || null : null;
+  // A full-surface answer below Class D (αw < 0.30) is real but is not an
+  // absorber anyone sells as treatment. In that case the honest recommendation
+  // is a rated absorber over a smaller area, so pick the lowest class that fits.
+  const practical = awFull < 0.30 ? coverage.find((c) => c.ok) || null : null;
 
-  return { ...g, rt60, aim, model, Acur, Aaim, dA, aBar, treatable, nrcFull, nrcRaw, feasible, coverage, practical };
+  return { ...g, rt60, aim, model, Acur, Aaim, dA, aBar, treatable, awFull, awRaw, feasible, coverage, practical };
 }
 
 /* ---- placement -------------------------------------------------------- *
@@ -1093,30 +1329,39 @@ function buildRecs(model, counts) {
   const f1 = (n) => Number(n).toFixed(1);
   const f2 = (n) => Number(n).toFixed(2);
 
+  // Without a measured RT60 there is no Sabine input, so there is no required
+  // αw and no coverage area. Saying so is the recommendation.
+  if (!numish(rt)) {
+    recs.push({
+      icon: AlertCircle, tone: "var(--bad)", title: "Missing parameter — RT60",
+      body: "No usable reverberation time came through with the deployed scan. Sabine solves absorption from RT60 and room volume, so without it no required αw, no coverage area and no target can be computed. Re-run the sound-sensor pass and deploy the scan again.",
+    });
+  }
+
   if (numish(rt)) {
     if (rt > RT60_TARGET.high) {
       recs.push({
-        icon: TrendingDown, tone: "var(--bad)", title: "Increase absorption — target NRC",
+        icon: TrendingDown, tone: "var(--bad)", title: "Increase absorption — target αw",
         body: plan
           ? (plan.practical
-              ? `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Over ${f1(plan.V)} m³ the room is short ${f1(plan.dA)} m² sabins. Apply NRC ${plan.practical.nrc.toFixed(2)} over about ${f1(plan.practical.area)} m² of wall or ceiling — ${plan.practical.pct.toFixed(0)}% of the treatable surface — to land at ${f2(plan.aim)} s. Spread across every surface the requirement is only NRC ${plan.nrcFull.toFixed(2)}, which is below anything commercially rated.`
-              : `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Over ${f1(plan.V)} m³ the room is short ${f1(plan.dA)} m² sabins of absorption. Apply a surface rated NRC ${plan.nrcFull.toFixed(2)} across the ${f1(plan.treatable)} m² of wall and ceiling to land at ${f2(plan.aim)} s.`)
-          : `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Room dimensions are needed to compute a required NRC.`,
+              ? `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Over ${f1(plan.V)} m³ the room is short ${f1(plan.dA)} m² sabins. Apply a Class ${plan.practical.cls} absorber (αw ≥ ${plan.practical.aw.toFixed(2)}, ISO 11654) over about ${f1(plan.practical.area)} m² of wall or ceiling — ${plan.practical.pct.toFixed(0)}% of the treatable surface — to land at ${f2(plan.aim)} s. Spread across every surface the requirement is only ${awText(plan.awFull)}, below the Class D floor for a rated absorber.`
+              : `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Over ${f1(plan.V)} m³ the room is short ${f1(plan.dA)} m² sabins of absorption. Apply a surface rated ${awText(plan.awFull)} across the ${f1(plan.treatable)} m² of wall and ceiling to land at ${f2(plan.aim)} s.`)
+          : `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Room dimensions are needed to compute a required αw.`,
         plan, kind: "absorb",
       });
     } else if (rt < RT60_TARGET.low) {
       recs.push({
-        icon: TrendingUp, tone: "var(--sim-dead)", title: "Reduce absorption — target NRC",
+        icon: TrendingUp, tone: "var(--sim-dead)", title: "Reduce absorption — target αw",
         body: plan
-          ? `RT60 is ${f2(rt)} s, below the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. The room is over-absorbing by ${f1(Math.abs(plan.dA))} m² sabins. Bring the treated wall and ceiling surface down to about NRC ${plan.nrcFull.toFixed(2)}, or swap absorptive area for reflective/diffusive area of equivalent size.`
-          : `RT60 is ${f2(rt)} s, below the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Room dimensions are needed to compute a required NRC.`,
+          ? `RT60 is ${f2(rt)} s, below the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. The room is over-absorbing by ${f1(Math.abs(plan.dA))} m² sabins. Bring the treated wall and ceiling surface down to about ${awText(plan.awFull)}, or swap absorptive area for reflective/diffusive area of equivalent size.`
+          : `RT60 is ${f2(rt)} s, below the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Room dimensions are needed to compute a required αw.`,
         plan, kind: "reflect",
       });
     } else {
       recs.push({
-        icon: CheckCircle2, tone: "var(--ok)", title: "RT60 within target — hold current NRC",
+        icon: CheckCircle2, tone: "var(--ok)", title: "RT60 within target — hold current absorption",
         body: plan
-          ? `RT60 is ${f2(rt)} s, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} s band. The room's average absorption coefficient is ᾱ ${plan.aBar.toFixed(2)}. Keep any new surface at or near NRC ${plan.aBar.toFixed(2)} so the balance holds.`
+          ? `RT60 is ${f2(rt)} s, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} s band. The room's average absorption coefficient is ᾱ ${plan.aBar.toFixed(2)}. Keep any new surface at or near ${awText(toAwStep(plan.aBar))} so the balance holds.`
           : `RT60 is ${f2(rt)} s, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} s band.`,
         plan, kind: "hold",
       });
@@ -1124,35 +1369,31 @@ function buildRecs(model, counts) {
   }
 
   // The quantity above is room-wide; this is where it lands. Basis is whichever
-  // catalogue rating the headline recommendation already settled on.
+  // ISO class the headline recommendation already settled on.
   const basis = plan && plan.dA > 0 ? (plan.practical || plan.coverage.find((c) => c.ok)) : null;
   const alloc = basis ? allocateToSpots(model.spots, basis.area) : null;
 
   if (counts.hot > 0) {
-    const localNrc = plan ? Math.max(0.6, Math.min(1, toNrcStep(plan.nrcRaw + 0.1))) : 0.85;
+    // Hotspot surfaces get one step more than the room needs, never below
+    // Class C (αw 0.60, "highly absorbing").
+    const localAw = plan ? Math.max(0.6, Math.min(1, toAwStep(plan.awRaw + 0.1))) : 0.80;
     recs.push({
-      icon: Volume2, tone: "var(--bad)", title: `${counts.hot} hotspot${counts.hot > 1 ? "s" : ""} — local NRC ${localNrc.toFixed(2)}`,
+      icon: Volume2, tone: "var(--bad)", title: `${counts.hot} hotspot${counts.hot > 1 ? "s" : ""} — local ${awText(localAw)}`,
       body: alloc && basis
-        ? `Energy is building up at ${counts.hot === 1 ? "this location" : "these locations"}. Split the ${f1(basis.area)} m² of NRC ${basis.nrc.toFixed(2)} coverage across the bounding surfaces below rather than spreading it evenly${alloc.weighted && numish(alloc.mean) ? ` — each share is weighted by how far that reading sits above the room mean of ${f2(alloc.mean)}` : ""}. Raise the rating to NRC ${localNrc.toFixed(2)} on the two surfaces nearest the strongest reading.`
-        : `Energy is building up at ${counts.hot === 1 ? "this location" : "these locations"}. Specify a higher local rating — NRC ${localNrc.toFixed(2)} or better — on the two nearest bounding surfaces, rather than spreading the same rating evenly around the room.`,
+        ? `Energy is building up at ${counts.hot === 1 ? "this location" : "these locations"}. Split the ${f1(basis.area)} m² of Class ${basis.cls} coverage across the bounding surfaces below rather than spreading it evenly${alloc.weighted && numish(alloc.mean) ? ` — each share is weighted by how far that reading sits above the room mean of ${f2(alloc.mean)}` : ""}. Raise the rating to ${awText(localAw)} on the two surfaces nearest the strongest reading.`
+        : `Energy is building up at ${counts.hot === 1 ? "this location" : "these locations"}. Specify a higher local rating — ${awText(localAw)} or better — on the two nearest bounding surfaces, rather than spreading the same rating evenly around the room.`,
       alloc, basis, kind: "place",
     });
   }
   if (counts.dead > 0) {
     recs.push({
-      icon: Radio, tone: "var(--sim-dead)", title: `${counts.dead} deadspot${counts.dead > 1 ? "s" : ""} — cap local NRC at 0.30`,
-      body: `Coverage drops out at ${counts.dead === 1 ? "this location" : "these locations"}. Absorption cannot restore energy that never arrived, so keep the surrounding surfaces below NRC 0.30 to stay reflective, add diffusion, or reposition the source. These points are excluded from the coverage split above.`,
+      icon: Radio, tone: "var(--sim-dead)", title: `${counts.dead} deadspot${counts.dead > 1 ? "s" : ""} — keep local αw below 0.30`,
+      body: `Coverage drops out at ${counts.dead === 1 ? "this location" : "these locations"}. Absorption cannot restore energy that never arrived, so keep the surrounding surfaces below Class D (αw < 0.30 — Class E or not classified) to stay reflective, add diffusion, or reposition the source. These points are excluded from the coverage split above.`,
     });
   }
 
   // Validity notes. Neither blocks the recommendation; both change how much
   // weight it should carry when it is defended.
-  if (model.spotsDerived && model.spots?.length) {
-    recs.push({
-      icon: Target, tone: "var(--warn)", title: "Labels derived, not read",
-      body: `No classification column was found in the deployed bundle, so hot / dead labels were split at the median of the level column in “${model.spotsFrom || "the scan data"}”. Publish the Classification tab's label column to have these read directly.`,
-    });
-  }
   if (alloc && !alloc.diffuse) {
     recs.push({
       icon: Target, tone: "var(--warn)", title: "Field is not diffuse — placement over quantity",
@@ -1167,8 +1408,15 @@ function buildRecs(model, counts) {
   }
   if (plan && plan.dA > 0) {
     recs.push({
-      icon: Radio, tone: "var(--faint)", title: "NRC excludes low frequency",
-      body: "NRC averages 250–2000 Hz only; 125 Hz is not in the rating. Any bass buildup or modal problem in this room will survive a panel meeting these figures and needs volume-based treatment instead.",
+      icon: Radio, tone: "var(--faint)", title: "αw excludes low frequency",
+      body: "The ISO 11654 reference curve starts at the 250 Hz octave band, and the standard states the rating is not appropriate below it. Any bass buildup or modal problem in this room can survive a product meeting these figures — check the full αp curve at 125 Hz, or add volume-based treatment. An (L) shape indicator on a product only flags extra absorption at 250 Hz, not 125 Hz.",
+    });
+  }
+
+  if (numish(rt) && !numish(model.room?.h)) {
+    recs.push({
+      icon: AlertTriangle, tone: "var(--warn)", title: "Missing parameter — room height",
+      body: "No height was deployed with the room row, so the volume behind every figure above assumes 2.60 m. A real ceiling height changes V directly, and with it the absorption deficit and every coverage area in the table.",
     });
   }
 
@@ -1179,9 +1427,9 @@ function buildRecs(model, counts) {
   return recs;
 }
 
-/* Coverage table — the same absorption deficit met by different ratings.
-   Higher NRC means less area to cover; the installer picks the trade-off. */
-function NrcTable({ plan }) {
+/* Coverage table — the same absorption deficit met by each ISO 11654 class.
+   A higher class means less area to cover; the installer picks the trade-off. */
+function AwTable({ plan }) {
   if (!plan || !Math.abs(plan.dA)) return null;
   const cell = { padding: "6px 10px", textAlign: "right", whiteSpace: "nowrap" };
   const head = { ...cell, fontWeight: 600, opacity: 0.7, borderBottom: "1px solid rgba(255,255,255,0.10)" };
@@ -1190,15 +1438,19 @@ function NrcTable({ plan }) {
       <table style={{ borderCollapse: "collapse", fontSize: "0.86em", width: "100%", maxWidth: 520 }}>
         <thead>
           <tr>
-            <th style={{ ...head, textAlign: "left" }}>Rating applied</th>
+            <th style={{ ...head, textAlign: "left" }}>ISO class</th>
+            <th style={{ ...head, textAlign: "left" }}>Description</th>
+            <th style={head}>Min αw</th>
             <th style={head}>Area required</th>
             <th style={head}>Of wall + ceiling</th>
           </tr>
         </thead>
         <tbody>
           {plan.coverage.map((c) => (
-            <tr key={c.nrc} style={{ opacity: c.ok ? 1 : 0.4 }}>
-              <td style={{ ...cell, textAlign: "left" }}>NRC {c.nrc.toFixed(2)}</td>
+            <tr key={c.cls} style={{ opacity: c.ok ? 1 : 0.4 }}>
+              <td style={{ ...cell, textAlign: "left" }}>Class {c.cls}</td>
+              <td style={{ ...cell, textAlign: "left" }}>{c.label}</td>
+              <td style={cell}>{c.aw.toFixed(2)}</td>
               <td style={cell}>{c.ok ? `${c.area.toFixed(1)} m²` : "not achievable"}</td>
               <td style={cell}>{c.ok ? `${c.pct.toFixed(0)}%` : "—"}</td>
             </tr>
@@ -1209,10 +1461,11 @@ function NrcTable({ plan }) {
         Room volume {plan.V.toFixed(1)} m³ · treatable surface {plan.treatable.toFixed(1)} m² ·
         current ᾱ {plan.aBar.toFixed(2)} · deficit {plan.dA >= 0 ? "+" : ""}{plan.dA.toFixed(1)} m² sabins.
         Derived from {plan.model || "Sabine"} (RT60 = 0.161 V / A); floor excluded from treatable area.
+        Areas sized at each class's lowest αw (ISO 11654 Annex B).
       </div>
       {!plan.feasible && (
         <div style={{ marginTop: 8, fontSize: "0.82em", lineHeight: 1.5, padding: "8px 10px", borderRadius: 8, background: "rgba(255,91,82,0.10)", border: "1px solid rgba(255,91,82,0.30)" }}>
-          The required coefficient exceeds NRC 1.00 — full-surface treatment alone cannot reach the target.
+          The required coefficient exceeds αw 1.00, the top of Class A — full-surface treatment alone cannot reach the target.
           Add volume-based absorption (bass traps, freestanding baffles) or relax the RT60 target.
         </div>
       )}
@@ -1220,7 +1473,7 @@ function NrcTable({ plan }) {
   );
 }
 
-/* Placement table — the coverage area from NrcTable, shared out across the
+/* Placement table — the coverage area from AwTable, shared out across the
    measured points. This is the half Sabine can't answer. */
 function SpotAllocTable({ alloc, basis }) {
   if (!alloc || !basis) return null;
@@ -1263,7 +1516,7 @@ function SpotAllocTable({ alloc, basis }) {
         </tbody>
       </table>
       <div style={{ marginTop: 8, fontSize: "0.82em", opacity: 0.65, lineHeight: 1.5 }}>
-        {basis.area.toFixed(1)} m² of NRC {basis.nrc.toFixed(2)} split across the{" "}
+        {basis.area.toFixed(1)} m² of Class {basis.cls} (αw ≥ {basis.aw.toFixed(2)}) split across the{" "}
         {alloc.hotCount} point{alloc.hotCount > 1 ? "s" : ""} the Classification tab marked as
         hotspots{alloc.weighted && numish(alloc.mean)
           ? `, weighted by level above the room mean of ${alloc.mean.toFixed(2)} · spread ${(alloc.cv * 100).toFixed(0)}%`
@@ -1275,41 +1528,359 @@ function SpotAllocTable({ alloc, basis }) {
   );
 }
 
-function Recommendations({ model, hasModel, counts }) {
+/* ---- consumer guide ------------------------------------------------------ *
+ * The recommendation, told for someone who has never heard of RT60 or αw.
+ * Same numbers as the technical cards (acousticPlan / allocateToSpots), just
+ * said in plain words: a verdict, an echo gauge, and three steps — what to
+ * buy, where to put it, where not to. The panel grade is picked here and
+ * every amount below it updates. The original tables stay one click away
+ * under "Technical details" for the panel review.
+ * ------------------------------------------------------------------------ */
+
+// Plain names for the ISO 11654 classes — what a shopper actually weighs.
+const GRADE_NAME = { A: "Best", B: "Very good", C: "Good", D: "Basic" };
+
+// Put an area into something a person can picture. Small rooms get A4 sheets,
+// anything bigger gets standard 60 × 60 cm panels.
+const A4_M2 = 0.21 * 0.297;
+const PANEL_M2 = 0.6 * 0.6;
+function relatableArea(m2) {
+  if (!numish(m2) || m2 <= 0) return "";
+  if (m2 < PANEL_M2 * 2) {
+    const n = Math.max(1, Math.ceil(m2 / A4_M2));
+    return `about ${n} sheet${n > 1 ? "s" : ""} of A4 paper`;
+  }
+  const n = Math.max(1, Math.ceil(m2 / PANEL_M2));
+  return `about ${n} panel${n > 1 ? "s" : ""} of 60 × 60 cm`;
+}
+const areaText = (m2) => (m2 < 0.1 ? `${(m2 * 10000).toFixed(0)} cm²` : `${m2.toFixed(2)} m²`);
+
+// Bearing -> the side of the room it points at, using the twin's cardinals.
+const COMPASS = ["north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"];
+const sideOf = (deg) => COMPASS[Math.round((((deg % 360) + 360) % 360) / 45) % 8];
+
+function EchoGauge({ rt }) {
+  const max = Math.max(1, rt * 1.15, RT60_TARGET.high * 1.6);
+  const pct = (v) => `${Math.min(100, (v / max) * 100).toFixed(1)}%`;
   return (
-    <section className="rec">
-      <div className="rec-head">
-        <span className="ic"><Target size={16} color="var(--orange)" /></span>
-        <div><div className="t">Recommendations</div><div className="s">Required absorption coefficient (NRC) to bring RT60 into target</div></div>
+    <div className="rg-gauge" role="img"
+      aria-label={`Echo time ${rt.toFixed(2)} seconds; goal ${RT60_TARGET.low} to ${RT60_TARGET.high} seconds`}>
+      <div className="rg-gauge-track">
+        <span className="rg-gauge-goal" style={{ "--from": pct(RT60_TARGET.low), "--to": pct(RT60_TARGET.high) }} />
+        <span className="rg-gauge-you" style={{ "--at": pct(rt) }}>
+          <span className="rg-gauge-tag">Your room {rt.toFixed(1)} s</span>
+        </span>
       </div>
-      {!hasModel ? (
-        <div className="rec-empty">Deploy a room scan to generate recommendations.</div>
-      ) : (
-        <div className="rec-grid">
-          {buildRecs(model, counts).map((r, i) => {
-            const Icon = r.icon;
-            // A card carrying a table needs the whole row — squeezed into a
-            // third of the grid the table overflows its cell and paints over
-            // the neighbouring card.
-            const wide = (r.plan && r.kind !== "hold") || r.kind === "place";
+      <div className="rg-gauge-scale">
+        <span>Dead</span>
+        <span className="rg-gauge-goal-label" style={{ "--from": pct(RT60_TARGET.low), "--to": pct(RT60_TARGET.high) }}>
+          Goal {RT60_TARGET.low}–{RT60_TARGET.high} s
+        </span>
+        <span>Echoey</span>
+      </div>
+    </div>
+  );
+}
+
+function GradePicker({ options, value, onChange }) {
+  return (
+    <div className="rg-grades" role="radiogroup" aria-label="Panel grade">
+      {options.map((c) => (
+        <button
+          key={c.cls}
+          type="button"
+          role="radio"
+          aria-checked={value === c.cls}
+          disabled={!c.ok}
+          className={`rg-grade${value === c.cls ? " on" : ""}`}
+          onClick={() => onChange(c.cls)}
+        >
+          <span className="rg-grade-name">{GRADE_NAME[c.cls]}</span>
+          <span className="rg-grade-cls">Class {c.cls}</span>
+          <span className="rg-grade-note">
+            {c.ok ? `Soaks up ${Math.round(c.aw * 100)}%+ of sound` : "Not enough on its own"}
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ShareBar({ pct }) {
+  return (
+    <span className="rg-bar" aria-hidden="true">
+      <span className="rg-bar-fill" style={{ "--w": `${Math.max(2, Math.min(100, pct)).toFixed(0)}%` }} />
+    </span>
+  );
+}
+
+function RecommendationGuide({ model, counts }) {
+  const rt = model.rt60;
+  const plan = numish(rt) ? acousticPlan(model.room, rt) : null;
+
+  // Default grade = the one the technical plan already settled on.
+  const options = plan ? plan.coverage.slice().reverse() : []; // A first
+  const fallback = plan && plan.dA > 0 ? (plan.practical || plan.coverage.find((c) => c.ok)) : null;
+  const [pick, setPick] = useState(fallback ? fallback.cls : null);
+  const chosen = options.find((c) => c.cls === pick && c.ok) || fallback;
+  const alloc = chosen ? allocateToSpots(model.spots, chosen.area) : null;
+
+  if (!numish(rt)) {
+    return (
+      <div className="rg-verdict" data-tone="warn">
+        <div className="rg-verdict-title">We couldn't measure the echo yet</div>
+        <p className="rg-lead">
+          The scan came through without a reverberation reading, so there's nothing to judge the room by.
+          Run the sound pass on the device again and re-deploy the scan.
+        </p>
+      </div>
+    );
+  }
+
+  const state = rt > RT60_TARGET.high ? "echoey" : rt < RT60_TARGET.low ? "dead" : "ok";
+  const times = rt / ((RT60_TARGET.low + RT60_TARGET.high) / 2);
+  const verdict = {
+    echoey: {
+      tone: "bad", title: "Your room is too echoey",
+      lead: `Sound keeps bouncing around for ${rt.toFixed(1)} seconds before it fades. For clear voices and music it should fade in about half a second — this room holds on ${times >= 1.5 ? `roughly ${times.toFixed(0)}× too long` : "a little too long"}.`,
+    },
+    dead: {
+      tone: "cool", title: "Your room sounds too dead",
+      lead: `Sound dies away after only ${rt.toFixed(1)} seconds. The goal is ${RT60_TARGET.low}–${RT60_TARGET.high} seconds, so right now voices and music can sound flat and muffled.`,
+    },
+    ok: {
+      tone: "ok", title: "Your room sounds balanced",
+      lead: `Sound fades in ${rt.toFixed(1)} seconds, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} second goal. No treatment is needed.`,
+    },
+  }[state];
+
+  const localAw = plan ? Math.max(0.6, Math.min(1, toAwStep(plan.awRaw + 0.1))) : 0.8;
+  const localCls = isoClassOf(localAw);
+
+  const tips = [];
+  if (alloc && !alloc.diffuse) tips.push({
+    icon: Target, title: "Where matters more than how much",
+    body: "Sound is uneven across this room, so putting panels in the right spots will do more than buying extra.",
+  });
+  if (plan && plan.dA > 0) tips.push({
+    icon: Volume2, title: "Deep bass is a separate job",
+    body: "These panels tame echo in voices and most music. If you still hear a boomy low rumble afterwards, thick bass traps in the corners are what fix that.",
+  });
+  if (!numish(model.room?.h)) tips.push({
+    icon: AlertTriangle, title: "Ceiling height was guessed",
+    body: "The scan didn't include the room height, so we assumed 2.6 m. Re-scan for exact amounts.",
+  });
+
+  return (
+    <div className="rg">
+      <div className="rg-verdict" data-tone={verdict.tone}>
+        <div className="rg-verdict-title">{verdict.title}</div>
+        <p className="rg-lead">{verdict.lead}</p>
+        <EchoGauge rt={rt} />
+      </div>
+
+      {state === "ok" && (
+        <div className="rg-step">
+          <span className="rg-step-num">1</span>
+          <div className="rg-step-body">
+            <div className="rg-step-title">Keep the room as it is</div>
+            <p>If you add furniture, curtains or panels later, scan again to check the balance still holds.</p>
+          </div>
+        </div>
+      )}
+
+      {state === "dead" && (
+        <div className="rg-step">
+          <span className="rg-step-num">1</span>
+          <div className="rg-step-body">
+            <div className="rg-step-title">Bring back some reflection</div>
+            <p>
+              {plan
+                ? `Take down roughly ${areaText(Math.abs(plan.dA))} of soft panels (${relatableArea(Math.abs(plan.dA))}), or cover the same amount with hard surfaces — wood, a bookshelf, or a diffuser.`
+                : "Take down some soft panels, or add hard surfaces like wood or a bookshelf. Scan the room size to get an exact amount."}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {state === "echoey" && (
+        <>
+          <div className="rg-step">
+            <span className="rg-step-num">1</span>
+            <div className="rg-step-body">
+              <div className="rg-step-title">Add sound-absorbing panels</div>
+              {!plan ? (
+                <p>Scan the room's size so we can work out how many panels you need.</p>
+              ) : !chosen ? (
+                <p>
+                  Even covering every wall and the ceiling won't be enough here. Add thick, free-standing panels or
+                  bass traps that stand in the room, not just on the walls.
+                </p>
+              ) : (
+                <>
+                  <p>Pick a panel grade. Better panels mean fewer of them. The grade is printed on the product as its ISO class.</p>
+                  <GradePicker options={options} value={chosen.cls} onChange={setPick} />
+                  <div className="rg-result">
+                    <div className="rg-result-big">{areaText(chosen.area)}</div>
+                    <div className="rg-result-text">
+                      of <b>{GRADE_NAME[chosen.cls].toLowerCase()} (Class {chosen.cls})</b> panels — {relatableArea(chosen.area)}.
+                      <span className="rg-result-sub">
+                        <ShareBar pct={chosen.pct} /> That covers {chosen.pct < 1 ? "under 1" : chosen.pct.toFixed(0)}% of your walls and ceiling.
+                      </span>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {counts.hot > 0 && (
+            <div className="rg-step">
+              <span className="rg-step-num">2</span>
+              <div className="rg-step-body">
+                <div className="rg-step-title">Put them where it's loudest</div>
+                <p>
+                  The scan found {counts.hot} loud spot{counts.hot > 1 ? "s" : ""} — shown in red in the twin above.
+                  Mount the panels on the wall each one faces, starting with the loudest.
+                </p>
+                {alloc && (
+                  <ul className="rg-where">
+                    {alloc.rows.map((r, i) => (
+                      <li key={r.idx}>
+                        <span className="rg-where-name">
+                          {numish(r.angle) ? `${sideOf(r.angle)[0].toUpperCase()}${sideOf(r.angle).slice(1)} wall` : `Loud spot ${r.idx}`}
+                          {i === 0 && <span className="rg-chip">loudest</span>}
+                        </span>
+                        <ShareBar pct={r.share * 100} />
+                        <span className="rg-where-amt">{(r.share * 100).toFixed(0)}% · {areaText(r.area)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {plan && localCls !== "Not classified" && (
+                  <p className="rg-hint">
+                    On the two surfaces nearest the loudest spot, use a {GRADE_NAME[localCls]?.toLowerCase() || "higher"} grade (Class {localCls}) or better.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {counts.dead > 0 && state !== "ok" && (
+        <div className="rg-step">
+          <span className="rg-step-num">{state === "echoey" ? (counts.hot > 0 ? 3 : 2) : 2}</span>
+          <div className="rg-step-body">
+            <div className="rg-step-title">Leave the quiet spots bare</div>
+            <p>
+              {counts.dead} spot{counts.dead > 1 ? "s are" : " is"} already too quiet — shown in blue in the twin.
+              Panels there would make it worse. If they bother you, move the speaker or add something that scatters
+              sound, like a bookshelf, instead.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {tips.length > 0 && (
+        <div className="rg-tips">
+          {tips.map((t, i) => {
+            const Icon = t.icon;
             return (
-              <div
-                key={i}
-                className="rec-cell"
-                style={wide ? { gridColumn: "1 / -1", minWidth: 0 } : { minWidth: 0 }}
-              >
-                <span className="ic"><Icon size={16} color={r.tone} /></span>
-                <div style={{ minWidth: 0 }}>
-                  <div className="t">{r.title}</div>
-                  <div className="n">{r.body}</div>
-                  {r.plan && r.kind !== "hold" && <NrcTable plan={r.plan} />}
-                  {r.kind === "place" && <SpotAllocTable alloc={r.alloc} basis={r.basis} />}
-                </div>
+              <div key={i} className="rg-tip">
+                <Icon size={15} color="var(--warn)" />
+                <div><b>{t.title}.</b> {t.body}</div>
               </div>
             );
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+function Recommendations({ model, hasModel, counts }) {
+  return (
+    <section className="rec">
+      <div className="rec-head">
+        <span className="ic"><Target size={16} color="var(--orange)" /></span>
+        <div><div className="t">Recommendations</div><div className="s">What your scan found and how to fix it</div></div>
+      </div>
+      {!hasModel ? (
+        <div className="rec-empty">Deploy a room scan to see how your room sounds and what to change.</div>
+      ) : (
+        <>
+          <RecommendationGuide key={model.rt60} model={model} counts={counts} />
+          <details className="rg-tech">
+            <summary>Technical details (ISO 11654 · Sabine)</summary>
+            <div className="rec-grid">
+              {buildRecs(model, counts).map((r, i) => {
+                const Icon = r.icon;
+                // A card carrying a table needs the whole row — squeezed into a
+                // third of the grid the table overflows its cell and paints over
+                // the neighbouring card.
+                const wide = (r.plan && r.kind !== "hold") || r.kind === "place";
+                return (
+                  <div
+                    key={i}
+                    className="rec-cell"
+                    style={wide ? { gridColumn: "1 / -1", minWidth: 0 } : { minWidth: 0 }}
+                  >
+                    <span className="ic"><Icon size={16} color={r.tone} /></span>
+                    <div style={{ minWidth: 0 }}>
+                      <div className="t">{r.title}</div>
+                      <div className="n">{r.body}</div>
+                      {r.plan && r.kind !== "hold" && <AwTable plan={r.plan} />}
+                      {r.kind === "place" && <SpotAllocTable alloc={r.alloc} basis={r.basis} />}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </details>
+        </>
+      )}
+    </section>
+  );
+}
+
+/* ---- parameter audit panel ----
+ * One block above the boxes, errors before warnings. Each entry names the
+ * parameter and says what stops working without it, so the fix is obvious
+ * without opening the sheet to guess. */
+function IssuePanel({ errors = [], warnings = [] }) {
+  if (!errors.length && !warnings.length) return null;
+  const items = [
+    ...errors.map((e) => ({ ...e, err: true })),
+    ...warnings.map((w) => ({ ...w, err: false })),
+  ];
+  return (
+    <section
+      style={{
+        display: "flex", flexDirection: "column", gap: 8,
+        margin: "0 0 16px", minWidth: 0,
+      }}
+    >
+      {items.map((it, i) => (
+        <div
+          key={i}
+          role={it.err ? "alert" : "status"}
+          style={{
+            display: "flex", alignItems: "flex-start", gap: 10,
+            padding: "10px 12px", borderRadius: 8,
+            fontSize: "0.86em", lineHeight: 1.55, overflowWrap: "anywhere",
+            background: it.err ? "rgba(255,91,82,0.10)" : "rgba(246,161,92,0.10)",
+            border: `1px solid ${it.err ? "rgba(255,91,82,0.30)" : "rgba(246,161,92,0.30)"}`,
+          }}
+        >
+          <span style={{ flex: "0 0 auto", marginTop: 1 }}>
+            {it.err ? <AlertCircle size={15} color="var(--bad)" /> : <AlertTriangle size={15} color="var(--warn)" />}
+          </span>
+          <div style={{ minWidth: 0 }}>
+            <b>{it.title}.</b> {it.body}
+          </div>
+        </div>
+      ))}
     </section>
   );
 }
@@ -1336,7 +1907,11 @@ function applyLayers(groups, layers) {
   if (groups.raw) groups.raw.visible = layers.raw;
   if (groups.spots) groups.spots.visible = layers.spots;
   if (groups.omni) groups.omni.visible = layers.omni;
-  if (groups.device) groups.device.visible = layers.device;
+  // One prototype at a time: Hardware 2 while Imbalanced sound is on (if it
+  // loaded), Hardware 1 otherwise.
+  const sound = layers.spots && !!groups.device2;
+  if (groups.device1) groups.device1.visible = layers.device && !sound;
+  if (groups.device2) groups.device2.visible = layers.device && sound;
 }
 function disposeDeep(obj) {
   obj.traverse?.((c) => {

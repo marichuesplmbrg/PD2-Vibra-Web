@@ -1,7 +1,8 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
 import {
   Table2, ChevronDown, Upload, Download, Rocket, Cloud, HardDrive, Check,
-  Ruler, Box, AlertCircle, Clock, Home, Save, RotateCcw, Radar, Volume2,
+  Ruler, Box, AlertCircle, Clock, Save, RotateCcw, Radar, Volume2,
+  AlertTriangle, X,
 } from "lucide-react";
 import { vibraHistory } from "./vibraHistory";
 
@@ -14,7 +15,26 @@ const TABLE_H = 460; // fixed height of each scan table
 /* ---- helpers ---- */
 const numish = (v) => v !== "" && v != null && !isNaN(parseFloat(v)) && isFinite(v);
 const fmtNum = (v) => (numish(v) ? Number(v).toLocaleString(undefined, { maximumFractionDigits: 3 }) : v);
-const parseTs = (s) => { const t = Date.parse(String(s).trim().replace(" ", "T")); return isNaN(t) ? null : t; };
+/* Timestamps arrive in two shapes: ISO-ish ("2026-09-23 16:09:12") and the
+   Google Sheets / US format ("9/23/2026 16:09:12", optionally with AM/PM).
+   The slash form is parsed by hand — browsers disagree on it, and swapping
+   the space for "T" (which ISO needs) makes it unparseable everywhere. */
+const parseTs = (s) => {
+  const str = String(s ?? "").trim();
+  if (!str) return null;
+  const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?)?$/i);
+  if (m) {
+    let [, mo, d, y, h = "0", mi = "0", se = "0", ap] = m;
+    h = Number(h);
+    if (ap) { if (/pm/i.test(ap) && h < 12) h += 12; if (/am/i.test(ap) && h === 12) h = 0; }
+    const t = new Date(Number(y), Number(mo) - 1, Number(d), h, Number(mi), Number(se)).getTime();
+    return isNaN(t) ? null : t;
+  }
+  const iso = Date.parse(str.replace(/^(\d{4}-\d{2}-\d{2}) /, "$1T"));
+  if (!isNaN(iso)) return iso;
+  const t = Date.parse(str);
+  return isNaN(t) ? null : t;
+};
 
 function parseCSV(text) {
   const clean = String(text).replace(/^\uFEFF/, "").replace(/\r/g, "");
@@ -31,7 +51,32 @@ function parseCSV(text) {
   });
   return grid.filter((r) => r.some((c) => c !== ""));
 }
-const gridToSheet = (grid) => (grid.length ? { columns: grid[0], rows: grid.slice(1) } : { columns: [], rows: [] });
+/* Only columns with a parameter name (header) are kept. Google Sheets' CSV
+   export also carries unnamed columns from the sheet's used range — empty or
+   stray values — and those can't be matched to any parameter, so they're
+   dropped here instead of being rendered as columns of dashes. */
+const blank = (v) => v === "" || v == null;
+/* Unnamed columns that DO hold values are still dropped (they can't be matched
+   to a parameter), but they're recorded on the sheet as `unnamed` so the table
+   can raise an error instead of losing the values silently. */
+const colLetter = (i) => { let s = ""; for (let n = i + 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s; return s; };
+function pruneEmptyCols(sheet) {
+  if (!sheet || !sheet.columns) return sheet;
+  const keep = sheet.columns.map((c) => !blank(String(c ?? "").trim()));
+  if (keep.every(Boolean)) return sheet;
+  const lost = [];
+  sheet.columns.forEach((_, i) => {
+    if (keep[i]) return;
+    const vals = sheet.rows.map((r) => r[i]).filter((v) => !blank(v));
+    if (vals.length) lost.push({ col: colLetter(i), count: vals.length, sample: vals.slice(0, 3) });
+  });
+  const pick = (arr) => arr.filter((_, i) => keep[i]);
+  return {
+    ...sheet, columns: pick(sheet.columns), rows: sheet.rows.map(pick),
+    ...(lost.length ? { unnamed: [...(sheet.unnamed || []), ...lost] } : {}),
+  };
+}
+const gridToSheet = (grid) => pruneEmptyCols(grid.length ? { columns: grid[0], rows: grid.slice(1) } : { columns: [], rows: [] });
 const tsIndex = (cols) => cols.findIndex((c) => /timestamp|time|date/i.test(c));
 const linkIndex = (cols) => cols.findIndex((c) => /(?:room|scan|session)[_\s-]?id/i.test(c));
 const hasDimCols = (cols) => cols.some((c) => /width/i.test(c)) && cols.some((c) => /length/i.test(c)) && cols.some((c) => /height/i.test(c));
@@ -57,15 +102,190 @@ function groupOf(sheet) {
 }
 const isPhysical = (g) => g === "dimensions" || g === "obstacles";
 
-/* Acoustic tables are shown without their timestamp column — acoustics aren't
-   picked by timestamp here. Shared by the on-screen table and the PDF so the
-   two can't diverge. */
-function dropTimeCols(sheet) {
-  if (!sheet) return { columns: [], rows: [], mode: "empty" };
-  const drop = sheet.columns.map((c, i) => (/timestamp|time|date/i.test(c) ? i : -1)).filter((i) => i >= 0);
-  if (!drop.length) return { columns: sheet.columns, rows: sheet.rows, mode: "rows" };
-  const keep = (arr) => arr.filter((_, i) => !drop.includes(i));
-  return { columns: keep(sheet.columns), rows: sheet.rows.map(keep), mode: "rows" };
+/* Acoustic view. Shared by the on-screen table and the PDF so the two can't
+   diverge. Only named parameters that hold values are shown, and each one
+   lists ONLY its own non-empty values — blank cells are never rendered:
+     - columns with no parameter name are dropped, along with their values;
+     - named columns with no values at all are dropped;
+     - the timestamp column is kept and shown like any other parameter, with
+       the values exactly as the Google Sheet holds them;
+     - within each parameter, blank cells are removed and the values close up.
+   Parameters recorded on the same rows (e.g. Frequency and T20 per band) stay
+   lined up; a parameter with a single value (e.g. overall RT60) just shows
+   that one value. `rows` is the same data laid out as a grid for the PDF. */
+/* When the acoustic scan was taken: the latest parseable date in a
+   timestamp / time / date column. A column named "timestamp" is tried first,
+   and numeric cells are skipped so a value like an RT60 "time" of 0.45 s can't
+   be mistaken for a date. Returns the cell as written in the sheet, or null. */
+function acousticTs(sheet) {
+  if (!sheet?.columns?.length) return null;
+  const cands = sheet.columns
+    .map((c, i) => [String(c), i])
+    .filter(([c]) => /timestamp|time|date/i.test(c))
+    .sort(([a], [b]) => Number(/timestamp/i.test(b)) - Number(/timestamp/i.test(a)));
+  for (const [, i] of cands) {
+    let best = null;
+    sheet.rows.forEach((r) => {
+      const v = r[i];
+      if (blank(v) || numish(v)) return;
+      const t = parseTs(v);
+      if (t != null && (!best || t > best.t)) best = { t, raw: String(v).trim() };
+    });
+    if (best) return best.raw;
+  }
+  return null;
+}
+
+function acousticView(raw) {
+  if (!raw) return { columns: [], rows: [], lists: [], mode: "empty" };
+  const sheet = pruneEmptyCols(raw);
+  const lists = sheet.columns
+    .map((name, i) => [name, sheet.rows.map((r) => r[i]).filter((v) => !blank(v))])
+    .filter(([, vals]) => vals.length > 0);
+  const depth = Math.max(0, ...lists.map(([, v]) => v.length));
+  const rows = Array.from({ length: depth }, (_, ri) => lists.map(([, v]) => v[ri] ?? ""));
+  return { columns: lists.map(([n]) => n), rows, lists, mode: "lists" };
+}
+
+/* ================================================================== *
+ * Local import validation
+ * ------------------------------------------------------------------
+ * Two separate gates, because a file can pass one and fail the other:
+ *   1. fileTypeProblem  — the name/size the OS reports, checked before
+ *      a single byte is read.
+ *   2. contentProblem   — what the bytes actually are. An .xlsx renamed
+ *      to .csv, a PDF, an HTML error page or a binary blob all arrive
+ *      with a perfectly innocent extension, and parseCSV would happily
+ *      turn any of them into a table of garbage.
+ * ================================================================== */
+const CSV_EXT = /\.(csv|tsv|txt)$/i;
+const MAX_IMPORT_MB = 8;
+
+function fileTypeProblem(file) {
+  const name = file.name || "(unnamed file)";
+  const ext = (name.match(/\.[^.\\/]+$/) || [""])[0];
+  if (!CSV_EXT.test(name)) {
+    return ext
+      ? `Wrong file type — “${name}” is a ${ext.slice(1).toUpperCase()} file. Import local expects a .csv exported from the scan sheet.`
+      : `Wrong file type — “${name}” has no file extension. Import local expects a .csv exported from the scan sheet.`;
+  }
+  if (file.size === 0) return `“${name}” is empty (0 bytes) — nothing to import.`;
+  if (file.size > MAX_IMPORT_MB * 1024 * 1024)
+    return `“${name}” is ${(file.size / 1048576).toFixed(1)} MB, over the ${MAX_IMPORT_MB} MB import limit. Split the export or import from Google Sheets instead.`;
+  return null;
+}
+
+function contentProblem(text, name) {
+  const head = String(text).slice(0, 2048);
+  if (/^PK\x03\x04/.test(head))
+    return `Wrong file type — “${name}” is a spreadsheet/zip archive (.xlsx or .zip) renamed to .csv. Open it and use File → Download → Comma-separated values.`;
+  if (/^%PDF/.test(head)) return `Wrong file type — “${name}” is a PDF, not CSV text.`;
+  if (/^\s*<(\?xml|!doctype|html)/i.test(head))
+    return `Wrong file type — “${name}” is an HTML/XML document, not CSV text. If it came from a share link, the server returned a web page instead of the sheet.`;
+  if (/^\s*[[{]/.test(head) && !head.includes(","))
+    return `Wrong file type — “${name}” looks like JSON, not CSV.`;
+  const junk = (head.match(/[\u0000-\u0008\u000E-\u001F\uFFFD]/g) || []).length;
+  if (junk > head.length * 0.02)
+    return `“${name}” isn't readable as text — it looks like a binary file that was renamed to .csv.`;
+  return null;
+}
+
+/* Structural checks that only make sense once the grid exists. */
+function gridProblem(grid, text, name) {
+  if (!grid.length) return { kind: "err", msg: `“${name}” contains no rows — the file is blank or only whitespace.` };
+  const [header, ...body] = grid;
+  if (!header.some((c) => c !== "")) return { kind: "err", msg: `“${name}” has no header row — the first line must name the columns.` };
+  if (!body.length) return { kind: "err", msg: `“${name}” has a header row but no data rows beneath it.` };
+  const firstLine = String(text).split("\n")[0] || "";
+  if (header.length === 1 && /[;\t|]/.test(firstLine))
+    return { kind: "err", msg: `“${name}” isn't comma-separated — it uses ${/\t/.test(firstLine) ? "tabs" : /;/.test(firstLine) ? "semicolons" : "pipes"}. Re-export with commas as the delimiter.` };
+  const blankHead = header.filter((c) => c === "").length;
+  if (blankHead) return { kind: "warn", msg: `Imported “${name}”, but ${blankHead} column${blankHead > 1 ? "s have" : " has"} no header name — those columns can't be matched to a parameter.` };
+  const ragged = body.filter((r) => r.length !== header.length).length;
+  if (ragged) return { kind: "warn", msg: `Imported “${name}”, but ${ragged} row${ragged > 1 ? "s don't" : " doesn't"} match the ${header.length}-column header — values may be shifted.` };
+  return null;
+}
+
+/* ================================================================== *
+ * Classification parameter audit
+ * ------------------------------------------------------------------
+ * The Classification tab is the only place hot / neutral / dead labels
+ * live, and each row has to be placeable in the room — by a bearing, or
+ * by an X/Y pair. Anything missing here surfaces downstream as an empty
+ * spot layer in Simulation, so it is caught and named at the table.
+ * ================================================================== */
+const RX_CLASS_COL = /class|label|zone|category|status|spot/i;
+const RX_ANGLE_COL = /^\s*(angle|bearing|azimuth|heading|deg)/i;
+const RX_X_COL = /^\s*(x|x_m|x_mm|x_pos|pos_x|coord_x|x_coord)\s*$/i;
+const RX_Y_COL = /^\s*(y|y_m|y_mm|y_pos|pos_y|coord_y|y_coord)\s*$/i;
+const RX_METRIC_COL = /rt60|reverb|spl|level|db|energy|score|intensity/i;
+const KNOWN_CLASS = /neutral|balanced|normal|nominal|within|ok|hot|high|live|bright|excess|dead|low|dull|null|quiet/i;
+
+const findCol = (cols, re) => cols.findIndex((c) => re.test(String(c)));
+const rowRef = (list) => {
+  const shown = list.slice(0, 6).map((n) => `row ${n}`).join(", ");
+  return list.length > 6 ? `${shown} +${list.length - 6} more` : shown;
+};
+
+function auditClassification(sheet) {
+  if (!sheet) return null;
+  const cols = sheet.columns || [];
+  const rows = sheet.rows || [];
+  const errors = [], warnings = [];
+
+  if (!cols.length || !rows.length) {
+    return { errors: ["Missing parameters — the Classification tab imported with no rows. Re-run the sound-sensor pass, or re-import the sheet."], warnings: [] };
+  }
+
+  const ci = findCol(cols, RX_CLASS_COL);
+  const ai = findCol(cols, RX_ANGLE_COL);
+  const xi = findCol(cols, RX_X_COL);
+  const yi = findCol(cols, RX_Y_COL);
+  const mi = findCol(cols, RX_METRIC_COL);
+
+  if (ci < 0) errors.push("Missing parameter — no classification column. Nothing in this tab says which readings are hotspots, neutral zones or deadspots.");
+  if (ai < 0 && (xi < 0 || yi < 0)) {
+    errors.push(
+      xi >= 0 || yi >= 0
+        ? `Missing parameter — only ${xi >= 0 ? "X" : "Y"} was found. A reading needs an angle/bearing column, or both X and Y, to be placed in the room.`
+        : "Missing parameter — no angle/bearing column and no X + Y pair, so no reading can be placed in the room."
+    );
+  }
+  if (mi < 0) warnings.push("No RT60 / level column — readings can be placed and labelled, but the panel split can only be even, not weighted.");
+
+  // Per-row completeness on the columns that do exist.
+  const required = [];
+  if (ci >= 0) required.push({ i: ci, name: cols[ci], num: false });
+  if (ai >= 0) required.push({ i: ai, name: cols[ai], num: true });
+  else { if (xi >= 0) required.push({ i: xi, name: cols[xi], num: true }); if (yi >= 0) required.push({ i: yi, name: cols[yi], num: true }); }
+  if (mi >= 0) required.push({ i: mi, name: cols[mi], num: true });
+
+  const blanks = new Map(), nonNum = new Map();
+  const unknownLabel = [];
+  rows.forEach((r, ri) => {
+    const line = ri + 2; // +1 for the header row, +1 for 1-based counting
+    required.forEach(({ i, name, num }) => {
+      const v = r[i];
+      if (v === "" || v == null) { if (!blanks.has(name)) blanks.set(name, []); blanks.get(name).push(line); }
+      else if (num && !numish(v)) { if (!nonNum.has(name)) nonNum.set(name, []); nonNum.get(name).push(line); }
+    });
+    if (ci >= 0) {
+      const raw = String(r[ci] ?? "").trim();
+      if (raw && !KNOWN_CLASS.test(raw.replace(/[\s_-]/g, ""))) unknownLabel.push(line);
+    }
+  });
+
+  blanks.forEach((list, name) => {
+    errors.push(`Missing parameter — “${name}” is blank on ${list.length} of ${rows.length} rows (${rowRef(list)}).`);
+  });
+  nonNum.forEach((list, name) => {
+    errors.push(`Invalid parameter — “${name}” holds a non-numeric value on ${list.length} row${list.length > 1 ? "s" : ""} (${rowRef(list)}).`);
+  });
+  if (unknownLabel.length) {
+    warnings.push(`${unknownLabel.length} row${unknownLabel.length > 1 ? "s carry" : " carries"} a classification label that isn't recognised as hotspot / neutral / deadspot (${rowRef(unknownLabel)}) — ${unknownLabel.length > 1 ? "they" : "it"} will be treated as neutral.`);
+  }
+
+  return { errors, warnings };
 }
 
 function linkRows(targetSheet, session, anchorLinkCol, sessions) {
@@ -94,16 +314,18 @@ export default function ParametersTable({ onSave } = {}) {
   if (initRef.current === null) initRef.current = vibraHistory.loadWorking() || {};
   const init = initRef.current;
 
-  const [sheets, setSheets] = useState(init.sheets || INITIAL_SHEETS);
+  const [sheets, setSheets] = useState(() =>
+    init.sheets ? Object.fromEntries(Object.entries(init.sheets).map(([k, v]) => [k, pruneEmptyCols(v)])) : INITIAL_SHEETS
+  );
   const [sessionKey, setSessionKey] = useState(init.sessionKey ?? "");
   const [physId, setPhysId] = useState(init.physId || "");
   const [acouId, setAcouId] = useState(init.acouId || "");
 
-  const [roomMenu, setRoomMenu] = useState(false);
   const [importMenu, setImportMenu] = useState(false);
   const [toast, setToast] = useState(null);
   const [cloudBusy, setCloudBusy] = useState(false);
   const [resetArmed, setResetArmed] = useState(false);
+  const [importIssue, setImportIssue] = useState(null); // { kind: "err"|"warn", msg }
   const fileRef = useRef(null);
 
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(null), 3400); return () => clearTimeout(t); }, [toast]);
@@ -122,11 +344,11 @@ export default function ParametersTable({ onSave } = {}) {
       .filter((s) => s.ts !== "" && s.ts != null)
       .sort((a, b) => (a.tsNum ?? 0) - (b.tsNum ?? 0));
   }, [anchor, anchorTsCol, anchorLinkCol]);
-  const sessionsNewest = useMemo(() => [...sessions].reverse(), [sessions]);
   const sessionSig = sessions.map((s) => s.ts).join("|");
+  /* The main system overwrites the sheet on every send, so it only ever holds
+     the latest room scan — always follow the newest one, no picker needed. */
   useEffect(() => {
-    const latest = sessions.length ? sessions[sessions.length - 1].ts : "";
-    setSessionKey((prev) => (prev && sessions.some((s) => s.ts === prev) ? prev : latest));
+    setSessionKey(sessions.length ? sessions[sessions.length - 1].ts : "");
   }, [anchorId, sessionSig]);
   const session = sessionKey ? sessions.find((s) => s.ts === sessionKey) || null : null;
 
@@ -143,6 +365,11 @@ export default function ParametersTable({ onSave } = {}) {
     });
   }, [sheetsSig]);
 
+  /* The acoustic scan time always comes from the Reverberation tab, whichever
+     acoustic tab is on screen — Classification doesn't carry its own. */
+  const reverbSheet = useMemo(() => acousticList.find(([, s]) => /reverb/i.test(s.label))?.[1] || null, [acousticList]);
+  const acouTs = useMemo(() => acousticTs(reverbSheet), [reverbSheet]);
+
   const physSheet = sheets[physId];
   const acouSheet = sheets[acouId];
 
@@ -156,26 +383,70 @@ export default function ParametersTable({ onSave } = {}) {
     return { columns: sheet.columns, rows, mode: "rows" };
   };
   const physTable = useMemo(() => tableFor(physSheet), [physSheet, session, sessions]);
-  // Acoustic table: show the Reverberation/Classification rows as-is, minus the
-  // timestamp column (acoustics isn't picked by timestamp here).
-  const acouTable = useMemo(() => dropTimeCols(acouSheet), [acouSheet]);
+  // Acoustic table: show the Reverberation/Classification rows as-is, including
+  // the timestamp column fetched from the Google Sheet.
+  const acouTable = useMemo(() => acousticView(acouSheet), [acouSheet]);
+
+  /* The Classification tab is audited whenever it is the selected acoustic
+     table, so a missing column or a blank cell is named here rather than
+     showing up later as an empty spot layer in the Simulation. */
+  const acouAudit = useMemo(
+    () => (acouSheet && groupOf(acouSheet) === "classification" ? auditClassification(acouSheet) : null),
+    [acouSheet]
+  );
 
   const dims = useMemo(() => (session ? dimsFromRow(anchor.columns, session.row) : { width: null, length: null, height: null }), [session, anchor]);
 
-  /* import */
+  /* import ------------------------------------------------------------ *
+   * A toast disappears after 3.4 s, which is fine for "imported 40 rows"
+   * and useless for "this file was rejected and here is why". Import
+   * failures therefore also raise a banner that stays until it is
+   * dismissed or the next import succeeds.
+   * -------------------------------------------------------------------- */
+  const failImport = (msg) => { setToast({ kind: "err", msg }); setImportIssue({ kind: "err", msg }); };
+
   const onLocalFile = (e) => {
-    const file = e.target.files?.[0]; if (!file) return;
+    const file = e.target.files?.[0];
+    e.target.value = ""; // reset first, so re-picking the same file still fires
+    if (!file) return;
+
+    const typeErr = fileTypeProblem(file);
+    if (typeErr) { failImport(typeErr); return; }
+
     const reader = new FileReader();
+    reader.onerror = () => failImport(`Couldn't read “${file.name}” — ${reader.error?.message || "the file could not be opened"}.`);
+    reader.onabort = () => failImport(`Import of “${file.name}” was cancelled before it finished.`);
     reader.onload = () => {
-      const { columns, rows } = gridToSheet(parseCSV(String(reader.result)));
-      const id = `local-${Date.now()}`;
-      setSheets((p) => ({ ...p, [id]: { label: `Local · ${file.name.replace(/\.csv$/i, "")}`, source: "local", columns, rows } }));
-      setToast({ kind: "ok", msg: `Imported ${rows.length} rows from ${file.name}` });
+      try {
+        const text = String(reader.result ?? "");
+        const contentErr = contentProblem(text, file.name);
+        if (contentErr) { failImport(contentErr); return; }
+
+        const pruned = gridToSheet(parseCSV(text));
+        const grid = pruned.columns.length ? [pruned.columns, ...pruned.rows] : [];
+        const problem = gridProblem(grid, text, file.name);
+        if (problem?.kind === "err") { failImport(problem.msg); return; }
+
+        const { columns, rows, unnamed } = pruned;
+        const id = `local-${Date.now()}`;
+        setSheets((p) => ({ ...p, [id]: { label: `Local · ${file.name.replace(/\.(csv|tsv|txt)$/i, "")}`, source: "local", columns, rows, ...(unnamed ? { unnamed } : {}) } }));
+        if (problem?.kind === "warn") {
+          setToast({ kind: "err", msg: problem.msg });
+          setImportIssue({ kind: "warn", msg: problem.msg });
+        } else {
+          setImportIssue(null);
+          setToast({ kind: "ok", msg: `Imported ${rows.length} row${rows.length === 1 ? "" : "s"} from ${file.name}` });
+        }
+      } catch (err) {
+        failImport(`Couldn't parse “${file.name}” — ${err.message}. Check it is a plain comma-separated export.`);
+      }
     };
-    reader.readAsText(file); e.target.value = "";
+
+    try { reader.readAsText(file); }
+    catch (err) { failImport(`Couldn't open “${file.name}” — ${err.message}.`); }
   };
   const importCloud = async () => {
-    setImportMenu(false); setCloudBusy(true);
+    setImportMenu(false); setCloudBusy(true); setImportIssue(null);
     try {
       const results = await Promise.all(CLOUD_TABS.map(async (tab) => {
         const res = await fetch(gvizUrl(tab));
@@ -187,7 +458,8 @@ export default function ParametersTable({ onSave } = {}) {
       const total = results.reduce((n, r) => n + r.rows.length, 0);
       setToast({ kind: "ok", msg: `Loaded ${results.length} sheets (${total} rows) from Google Sheets` });
     } catch (err) {
-      setToast({ kind: "err", msg: `Couldn't reach Google Sheets — ${err.message}. Check the sheet is shared and reachable.` });
+      const msg = `Couldn't reach Google Sheets — ${err.message}. Check the sheet is shared and reachable.`;
+      setToast({ kind: "err", msg }); setImportIssue({ kind: "err", msg });
     } finally { setCloudBusy(false); }
   };
 
@@ -203,12 +475,12 @@ export default function ParametersTable({ onSave } = {}) {
     return tabs;
   };
   const deploy = () => {
-    if (!session) { setToast({ kind: "err", msg: "Pick a room scan to deploy." }); return; }
+    if (!session) { setToast({ kind: "err", msg: "No room scan loaded — import one first." }); return; }
     vibraHistory.deploy({ roomTs: session.ts, dims, tabs: buildBundle(session), at: new Date().toISOString() });
     setToast({ kind: "ok", msg: `Deployed room scan ${session.ts} to Simulation` });
   };
   const saveView = () => {
-    if (!session) { setToast({ kind: "err", msg: "Pick a room scan to save." }); return; }
+    if (!session) { setToast({ kind: "err", msg: "No room scan loaded — import one first." }); return; }
     const entry = { label: session.ts, roomTs: session.ts, dims, tabs: buildBundle(session), savedAt: new Date().toISOString() };
     const saved = vibraHistory.add(entry);
     if (typeof onSave === "function") onSave(saved);
@@ -228,8 +500,8 @@ export default function ParametersTable({ onSave } = {}) {
   // what the user is looking at.
   const reportSection = (id, sheet) => {
     const physical = isPhysical(groupOf(sheet));
-    const t = physical ? tableFor(sheet) : dropTimeCols(sheet);
-    return { label: sheet.label, kind: physical ? "Physical" : "Acoustic", ...t };
+    const t = physical ? tableFor(sheet) : acousticView(sheet);
+    return { label: sheet.label, kind: physical ? "Physical" : "Acoustic", ...t, ts: physical ? null : acouTs };
   };
 
   const buildReport = () => {
@@ -249,7 +521,7 @@ export default function ParametersTable({ onSave } = {}) {
       .join("");
     return `<section class="sec">
       <h2>${esc(s.label)}<span class="kind">${esc(s.kind)} scan</span></h2>
-      <div class="meta">${s.rows.length} row${s.rows.length === 1 ? "" : "s"}</div>
+      <div class="meta">${s.rows.length} row${s.rows.length === 1 ? "" : "s"}${s.ts ? ` · Scanned ${esc(s.ts)}` : ""}</div>
       <table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>
     </section>`;
   };
@@ -290,6 +562,7 @@ export default function ParametersTable({ onSave } = {}) {
 <p class="sub">LiDAR physical scan and sound-sensor acoustic scan.</p>
 <div class="ident"><dl>
   <div><dt>Room scan</dt><dd>${esc(session ? session.ts : "—")}</dd></div>
+  <div><dt>Acoustic scan</dt><dd>${esc(acouTs || "—")}</dd></div>
   <div><dt>Width</dt><dd>${dim(dims.width)}</dd></div>
   <div><dt>Length</dt><dd>${dim(dims.length)}</dd></div>
   <div><dt>Height</dt><dd>${dim(dims.height)}</dd></div>
@@ -322,7 +595,7 @@ ${sections.map(sectionHtml).join("")}
   const loadBundle = (entry) => {
     if (!entry || !entry.tabs) return;
     const next = {};
-    Object.entries(entry.tabs).forEach(([label, t]) => { next[`saved-${label}`] = { label, source: "cloud", columns: t.columns || [], rows: t.rows || [] }; });
+    Object.entries(entry.tabs).forEach(([label, t]) => { next[`saved-${label}`] = pruneEmptyCols({ label, source: "cloud", columns: t.columns || [], rows: t.rows || [] }); });
     setSheets(next);
     setToast({ kind: "ok", msg: `Restored room scan ${entry.roomTs || entry.label}` });
   };
@@ -336,11 +609,11 @@ ${sections.map(sectionHtml).join("")}
   const resetAll = () => {
     vibraHistory.clearWorking();
     setSheets(INITIAL_SHEETS); setSessionKey(""); setPhysId(""); setAcouId(""); setResetArmed(false);
+    setImportIssue(null);
     setToast({ kind: "ok", msg: "Cleared the current scan data" });
   };
 
   const hasSheets = Object.keys(sheets).length > 0;
-  const roomLabel = session ? session.ts : (sessions.length ? "Select a scan" : "No room scans");
 
   return (
     <div className="vwrap">
@@ -351,29 +624,9 @@ ${sections.map(sectionHtml).join("")}
 
       {/* toolbar */}
       <div className="pt-toolbar">
-        {/* Room scan */}
-        <div className="menu-wrap">
-          <button className="btn" onClick={() => { setRoomMenu((v) => !v); setImportMenu(false); }} disabled={!sessions.length}>
-            <Home size={15} color={session ? "var(--violet)" : "var(--faint)"} />
-            <span className={`pick-lbl w200${session ? " on" : ""}`}>{roomLabel}</span>
-            <ChevronDown size={15} color="var(--muted)" className={`chev${roomMenu ? " open" : ""}`} />
-          </button>
-          {roomMenu && (
-            <Menu onClose={() => setRoomMenu(false)} width={260} scroll>
-              {sessionsNewest.length === 0 ? <div className="menu-note">No room scans loaded.</div>
-                : sessionsNewest.map((s, i) => (
-                  <MenuItem key={s.ts} active={sessionKey === s.ts} onClick={() => { setSessionKey(s.ts); setRoomMenu(false); }}>
-                    <span className="menu-left"><Home size={14} color="var(--faint)" /><span className="ell">{s.ts}</span>{i === 0 && <span className="menu-latest">latest</span>}</span>
-                    {sessionKey === s.ts && <Check size={15} color="var(--ok)" />}
-                  </MenuItem>
-                ))}
-            </Menu>
-          )}
-        </div>
-
         {/* Import */}
         <div className="menu-wrap">
-          <button className="btn" onClick={() => { setImportMenu((v) => !v); setRoomMenu(false); }} disabled={cloudBusy}>
+          <button className="btn" onClick={() => setImportMenu((v) => !v)} disabled={cloudBusy}>
             <Upload size={15} color="var(--muted)" /><span>{cloudBusy ? "Importing…" : "Import"}</span>
             <ChevronDown size={15} color="var(--muted)" className={`chev${importMenu ? " open" : ""}`} />
           </button>
@@ -403,6 +656,14 @@ ${sections.map(sectionHtml).join("")}
         </div>
       </div>
 
+      {/* import failure — stays put until dismissed, unlike the toast */}
+      {importIssue && (
+        <Banner kind={importIssue.kind} onClose={() => setImportIssue(null)}>
+          <b>{importIssue.kind === "err" ? "Import failed. " : "Imported with warnings. "}</b>
+          {importIssue.msg}
+        </Banner>
+      )}
+
       {/* physical + acoustic side by side */}
       <div className="pt-row">
         <div className="pt-cell">
@@ -416,7 +677,7 @@ ${sections.map(sectionHtml).join("")}
           <ScanSection variant="c" icon={<Volume2 size={16} color="var(--cyan)" />} acoustic
             title="Acoustic scan" subtitle="Sound sensor · reverberation & classification"
             tabs={acousticList} activeId={acouId} onTab={setAcouId} sheets={sheets}
-            table={acouTable} hasSheets={hasSheets} session={session}
+            table={acouTable} hasSheets={hasSheets} session={session} audit={acouAudit} when={acouTs} whenMissing={reverbSheet ? "No timestamp in the Reverberation tab" : "No Reverberation tab loaded"}
             emptyHint="Run the sound-sensor pass, or import the acoustic sheets." />
         </div>
       </div>
@@ -446,13 +707,26 @@ ${sections.map(sectionHtml).join("")}
 }
 
 /* ---- sensor section ---- */
-function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sheets, table, hasSheets, session, acoustic = false, emptyHint }) {
+function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sheets, table, hasSheets, session, acoustic = false, emptyHint, audit = null, when = null, whenMissing = "" }) {
   const activeSheet = sheets[activeId];
+  const errs = audit?.errors || [];
+  const warns = audit?.warnings || [];
   return (
     <section className="scan">
       <div className="scan-head">
         <span className={`scan-ic ${variant}`}>{icon}</span>
-        <div className="scan-h"><div className="scan-title">{title}</div><div className="scan-sub">{subtitle}</div></div>
+        <div className="scan-h">
+          <div className="scan-title">{title}</div>
+          <div className="scan-sub">{subtitle}</div>
+          {/* Acoustic scan timestamp — read from the sheet's time column, which
+              is kept out of the value grid itself. */}
+          {acoustic && activeSheet && (
+            <div className="scan-sub" style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 2 }}>
+              <Clock size={12} color="var(--muted)" />
+              <span>{when ? `Scanned ${when}` : whenMissing}</span>
+            </div>
+          )}
+        </div>
 
         {tabs.length > 1 && (
           <div className="seg">
@@ -463,8 +737,46 @@ function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sh
         )}
       </div>
 
+      {/* Parameter audit for the Classification tab. Errors first: a missing
+          column stops the spot layer from building at all, a warning only
+          changes how much the numbers can be leaned on. */}
+      {/* Values sitting in a column with no parameter name. They're left out of
+          the table, so say so — otherwise the data just disappears. */}
+      {activeSheet?.unnamed?.length > 0 && (
+        <Banner kind="err" inset>
+          <b>Missing parameter name.</b>
+          <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+            {activeSheet.unnamed.map((u, i) => (
+              <li key={i} style={{ marginTop: i ? 4 : 0 }}>
+                Column {u.col} of the “{activeSheet.label}” sheet holds {u.count} value{u.count > 1 ? "s" : ""} ({u.sample.join(", ")}{u.count > 3 ? ", …" : ""}) but has no header, so {u.count > 1 ? "they are" : "it is"} not shown. Add the parameter name in the header row and re-import.
+              </li>
+            ))}
+          </ul>
+        </Banner>
+      )}
+
+      {errs.length > 0 && (
+        <Banner kind="err" inset>
+          <b>Classification parameters incomplete.</b>
+          <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+            {errs.map((m, i) => <li key={i} style={{ marginTop: i ? 4 : 0 }}>{m}</li>)}
+          </ul>
+        </Banner>
+      )}
+      {warns.length > 0 && (
+        <Banner kind="warn" inset>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {warns.map((m, i) => <li key={i} style={{ marginTop: i ? 4 : 0 }}>{m}</li>)}
+          </ul>
+        </Banner>
+      )}
+
+      {acoustic && table.lists?.length > 0 ? (
+        <ParamColumns lists={table.lists} />
+      ) : (
       <ScanTable columns={table.columns} rows={table.rows} mode={table.mode} packLeft={acoustic}
-        empty={!hasSheets ? "Nothing imported yet." : !activeSheet ? emptyHint : (acoustic ? "No values." : !session ? "Select a room scan above." : (table.mode === "rows" ? "No data for this room scan." : "No values."))} />
+        empty={!hasSheets ? "Nothing imported yet." : !activeSheet ? emptyHint : (acoustic ? "No values." : !session ? "No room scan loaded." : (table.mode === "rows" ? "No data for this room scan." : "No values."))} />
+      )}
     </section>
   );
 }
@@ -521,6 +833,77 @@ function ScanTable({ columns, rows, mode, empty, packLeft = false }) {
           {rows.length === 0 && <tr><td className="empty" colSpan={Math.max(columns.length, 1) + (hug ? 1 : 0)}>{empty}</td></tr>}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+/* ---- acoustic parameters ----
+ * One small table per parameter, side by side, each holding only that
+ * parameter's values. They share the .dtable styles, so headers and rows line
+ * up across parameters, and a shorter parameter simply ends — there are no
+ * blank cells below or between its values. */
+function ParamColumns({ lists }) {
+  return (
+    <div className="scan-body thin-scroll">
+      {/* Each parameter takes an equal share of the width (never narrower than
+          its content), so the columns fill the panel edge to edge instead of
+          bunching left and leaving an empty band on the right. */}
+      <div style={{ display: "flex", alignItems: "flex-start", width: "100%", minWidth: "max-content" }}>
+        {lists.map(([name, vals]) => {
+          const numeric = vals.every(numish);
+          return (
+            <div key={name} style={{ flex: "1 1 0", minWidth: "max-content" }}>
+            <table className="dtable" style={{ width: "100%" }}>
+              <thead>
+                <tr><th style={{ whiteSpace: "nowrap", textAlign: "left" }}>{name}</th></tr>
+              </thead>
+              <tbody>
+                {vals.map((v, i) => (
+                  <tr key={i}><td style={{ whiteSpace: "nowrap", textAlign: "left" }}>{numeric ? fmtNum(v) : v}</td></tr>
+                ))}
+              </tbody>
+            </table>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ---- inline notice ----
+ * Two tones only: "err" for something that blocks the data being usable,
+ * "warn" for something that changes how far it can be trusted. Coloured
+ * from the same tokens the rest of the app reads, so a theme change can't
+ * leave a red box on a red panel. */
+function Banner({ kind = "err", inset = false, onClose, children }) {
+  const err = kind === "err";
+  return (
+    <div
+      role={err ? "alert" : "status"}
+      style={{
+        display: "flex", alignItems: "flex-start", gap: 10,
+        margin: inset ? "0 0 10px" : "0 0 14px",
+        padding: "10px 12px", borderRadius: 8,
+        fontSize: "0.86em", lineHeight: 1.55,
+        overflowWrap: "anywhere",
+        background: err ? "rgba(255,91,82,0.10)" : "rgba(246,161,92,0.10)",
+        border: `1px solid ${err ? "rgba(255,91,82,0.30)" : "rgba(246,161,92,0.30)"}`,
+      }}
+    >
+      <span style={{ flex: "0 0 auto", marginTop: 1 }}>
+        {err ? <AlertCircle size={15} color="var(--bad)" /> : <AlertTriangle size={15} color="var(--warn)" />}
+      </span>
+      <div style={{ minWidth: 0, flex: "1 1 auto" }}>{children}</div>
+      {onClose && (
+        <button
+          onClick={onClose}
+          aria-label="Dismiss"
+          style={{ flex: "0 0 auto", background: "none", border: 0, padding: 2, cursor: "pointer", lineHeight: 0 }}
+        >
+          <X size={14} color="var(--muted)" />
+        </button>
+      )}
     </div>
   );
 }
