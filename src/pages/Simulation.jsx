@@ -506,7 +506,9 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
   const [dep, setDep] = useState(() => vibraHistory.getDeployment());
   const [orbiting, setOrbiting] = useState(true);
   // Default view: only the room shell and its raw points; everything else is opt-in.
-  const [layers, setLayers] = useState({ shell: true, edges: false, raw: true, spots: false, omni: false, device: false });
+  // The Dashboard's Room twin (twinOnly) has no layers panel, so it always shows
+  // the detected hotspots and deadspots from the deployed scan.
+  const [layers, setLayers] = useState({ shell: true, edges: false, raw: true, spots: twinOnly, omni: false, device: false });
   const [hover, setHover] = useState(null);
   const hrefs = { hw1: deviceUrl || DEVICE_URLS.hw1, hw2: soundDeviceUrl || DEVICE_URLS.hw2 };
   const [devices, setDevices] = useState({ hw1: { geo: null, status: "loading" }, hw2: { geo: null, status: "loading" } });

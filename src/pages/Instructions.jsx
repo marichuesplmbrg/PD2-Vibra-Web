@@ -1,5 +1,5 @@
 import React from "react";
-import { Code2, Globe, Link2 } from "lucide-react";
+import { Cpu, RotateCw, Globe } from "lucide-react";
 
 const css = `
 .vibra-instructions {
@@ -10,12 +10,9 @@ const css = `
   --heading: #ffffff;
   --muted: #7c8697;
   --muted-2: #5f6a7c;
-  --code-bg: #0a0f1a;
-  --code-border: rgba(255,255,255,0.06);
   --grad: linear-gradient(120deg, #f6a34b 0%, #d267c9 55%, #a866f2 100%);
   --grad-soft: linear-gradient(120deg, rgba(246,163,75,0.16), rgba(168,102,242,0.16));
   --orange: #f6a34b;
-  --purple: #b06cf0;
 
   color: var(--text);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -41,9 +38,10 @@ const css = `
   background: var(--card-bg); border: 1px solid var(--card-border);
   border-radius: 16px; padding: 26px 26px 28px;
   position: relative; overflow: hidden;
-  transition: border-color .2s ease, transform .2s ease;
+  transition: border-color .2s ease;
 }
-.vibra-instructions .card:hover { border-color: var(--card-border-hover); transform: translateY(-2px); }
+.vibra-instructions .card:hover { border-color: var(--card-border-hover); }
+.vibra-instructions .card.wide { grid-column: 1 / -1; }
 .vibra-instructions .card::before {
   content: ""; position: absolute; left: 0; top: 0; bottom: 0;
   width: 3px; background: var(--grad); opacity: .9;
@@ -56,11 +54,15 @@ const css = `
 }
 .vibra-instructions .card-head h2 { margin: 0; font-size: 18px; font-weight: 700; color: var(--heading); letter-spacing: -0.01em; }
 .vibra-instructions .tag {
-  margin-left: auto; font-size: 11px; font-weight: 700; letter-spacing: .06em;
+  margin-left: auto; font-size: 11px; font-weight: 600;
   color: var(--muted); background: rgba(255,255,255,0.04);
   border: 1px solid var(--card-border); padding: 4px 9px; border-radius: 999px;
+  white-space: nowrap;
 }
-.vibra-instructions .lead { color: var(--muted); font-size: 14px; line-height: 1.55; margin: 4px 0 20px; max-width: 46ch; }
+.vibra-instructions .lead { color: var(--muted); font-size: 14px; line-height: 1.55; margin: 4px 0 20px; max-width: 60ch; }
+
+.vibra-instructions .group + .group { margin-top: 22px; }
+.vibra-instructions .group-title { font-size: 14px; font-weight: 700; color: var(--heading); margin: 0 0 12px; }
 
 .vibra-instructions .steps { list-style: none; display: flex; flex-direction: column; gap: 14px; padding: 0; margin: 0; }
 .vibra-instructions .steps li { display: flex; gap: 13px; align-items: flex-start; }
@@ -74,36 +76,18 @@ const css = `
 .vibra-instructions .steps .sub { color: var(--muted); }
 .vibra-instructions .steps b { font-weight: 700; }
 
-.vibra-instructions code.inline {
-  font-family: "SF Mono","JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
-  font-size: 12.5px; background: var(--code-bg); border: 1px solid var(--code-border);
-  color: #e6d0a8; padding: 1px 6px; border-radius: 6px; white-space: nowrap;
-}
-.vibra-instructions .snippet {
-  margin-top: 18px; background: var(--code-bg); border: 1px solid var(--code-border);
-  border-radius: 10px; padding: 13px 15px; display: flex; flex-direction: column; gap: 6px;
-  font-family: "SF Mono","JetBrains Mono",ui-monospace,Menlo,Consolas,monospace; font-size: 12.5px;
-}
-.vibra-instructions .snippet .line { color: #cdd5e2; }
-.vibra-instructions .snippet .prompt { color: var(--orange); user-select: none; }
-.vibra-instructions .snippet .cmt { color: var(--muted-2); }
+.vibra-instructions .options { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 6px; }
+.vibra-instructions .options li { color: var(--muted); font-size: 13.5px; line-height: 1.5; }
+.vibra-instructions .options b { color: var(--text); font-weight: 600; }
 
-.vibra-instructions .link-row {
-  margin-top: 18px; display: flex; align-items: center; gap: 10px;
-  background: var(--code-bg); border: 1px solid var(--code-border);
-  border-radius: 10px; padding: 11px 14px;
+.vibra-instructions .note {
+  margin-top: 20px; padding: 12px 14px; border-radius: 10px;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--card-border);
+  font-size: 13.5px; line-height: 1.5; color: var(--muted);
 }
-.vibra-instructions .link-row a { color: #d8b3ff; text-decoration: none; font-size: 13.5px; font-weight: 600; }
-.vibra-instructions .link-row a:hover { text-decoration: underline; }
-.vibra-instructions .copy {
-  margin-left: auto; font-size: 12px; color: var(--muted);
-  border: 1px solid var(--card-border); background: rgba(255,255,255,0.03);
-  border-radius: 7px; padding: 4px 10px; cursor: pointer;
-  transition: color .15s ease, border-color .15s ease;
-}
-.vibra-instructions .copy:hover { color: var(--text); border-color: var(--card-border-hover); }
+.vibra-instructions .note b { color: var(--text); font-weight: 600; }
 
-.vibra-instructions .footnote { max-width: 1080px; margin-top: 20px; font-size: 13px; color: var(--muted-2); }
+.vibra-instructions .footnote { max-width: 1080px; margin-top: 20px; font-size: 13px; color: var(--muted-2); line-height: 1.5; }
 .vibra-instructions .footnote b { color: var(--muted); font-weight: 600; }
 
 @media (max-width: 880px) {
@@ -112,129 +96,134 @@ const css = `
 }
 `;
 
-export default function Instructions() {
-  const copyUrl = (e) => {
-    if (navigator.clipboard) navigator.clipboard.writeText("https://app.vibra.io");
-    e.currentTarget.textContent = "Copied";
-  };
+/* Numbered step list. Steps are real sequences, so the numbers carry meaning. */
+function Steps({ items }) {
+  return (
+    <ol className="steps">
+      {items.map((body, i) => (
+        <li key={i}>
+          <span className="num">{i + 1}</span>
+          <span className="stepbody">{body}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
 
+export default function Instructions() {
   return (
     <>
       <style>{css}</style>
       <div className="vibra-instructions">
         <header className="page-head">
           <h1>Instructions</h1>
-          <p>How to run the prototype and read the dashboard</p>
+          <p>How to set up both prototypes and use the web application</p>
         </header>
 
         <section className="grid">
-          {/* Prototype */}
+
+          {/* Main prototype */}
           <article className="card">
             <div className="card-head">
-              <span className="card-icon">
-                <Code2 size={20} strokeWidth={2} />
-              </span>
-              <h2>Prototype</h2>
-              <span className="tag">LOCAL</span>
+              <span className="card-icon"><Cpu size={20} strokeWidth={2} /></span>
+              <h2>Main prototype</h2>
+              <span className="tag">Raspberry Pi</span>
             </div>
             <p className="lead">
-              Run the interactive prototype on your own machine when you want to change
-              parameters or test the simulation offline.
+              Measures the room with the LiDAR and ultrasonic sensor, then saves,
+              uploads or classifies the data.
             </p>
 
-            <ol className="steps">
-              <li>
-                <span className="num">1</span>
-                <span className="stepbody">Clone the repo and enter the folder.</span>
-              </li>
-              <li>
-                <span className="num">2</span>
-                <span className="stepbody">
-                  Install dependencies with <code className="inline">npm install</code>.
-                </span>
-              </li>
-              <li>
-                <span className="num">3</span>
-                <span className="stepbody">Start the dev server, then open the local URL it prints.</span>
-              </li>
-              <li>
-                <span className="num">4</span>
-                <span className="stepbody">
-                  Edit values in <b>Parameters table</b> and press <b>Run</b> to re-simulate.{" "}
-                  <span className="sub">Changes are not saved to the cloud.</span>
-                </span>
-              </li>
-            </ol>
+            <Steps items={[
+              <>Plug in the prototype.</>,
+              <>Open the <b>PDT6</b> folder.</>,
+              <>Launch <b>Vibra.exe</b>.</>,
+              <>
+                <b>Page 1</b> shows the live readings: width and length from the LiDAR,
+                and height from the ultrasonic sensor.
+              </>,
+              <>
+                <b>Page 2</b> gives three options:
+                <ul className="options">
+                  <li><b>Save locally.</b> Downloads the gathered data to the prototype.</li>
+                  <li><b>Upload.</b> Sends the gathered data straight to the Google Sheets database.</li>
+                  <li>
+                    <b>Classify.</b> Downloads the reverberation values from Google Sheets,
+                    classifies them, then uploads the classified data back to the sheet.
+                  </li>
+                </ul>
+              </>,
+            ]} />
+          </article>
 
-            <div className="snippet">
-              <div className="line">
-                <span className="prompt">$ </span>git clone https://github.com/vibra/app.git
-              </div>
-              <div className="line">
-                <span className="prompt">$ </span>cd app &amp;&amp; npm install
-              </div>
-              <div className="line">
-                <span className="prompt">$ </span>npm run dev{" "}
-                <span className="cmt"># → http://localhost:5173</span>
-              </div>
+          {/* Pole prototype */}
+          <article className="card">
+            <div className="card-head">
+              <span className="card-icon"><RotateCw size={20} strokeWidth={2} /></span>
+              <h2>Pole prototype</h2>
+              <span className="tag">ESP32 S3 + Arduino Uno</span>
+            </div>
+            <p className="lead">
+              Rotates the sound sensor around the room to measure reverberation.
+              Set up both parts before starting a run.
+            </p>
+
+            <div className="group">
+              <h3 className="group-title">Sound sensor (ICS)</h3>
+              <Steps items={[
+                <>Insert the two 3.7 V batteries.</>,
+                <>Turn on the battery holder module.</>,
+                <>Connect the battery holder power cable to the ESP32 S3.</>,
+                <>Press the reset button to start or restart it.</>,
+              ]} />
+            </div>
+
+            <div className="group">
+              <h3 className="group-title">Stepper motor</h3>
+              <Steps items={[
+                <>Plug in the main extension.</>,
+                <>Plug the Arduino Uno into the main extension.</>,
+                <>Plug the 5 V 10 A power supply into the main extension.</>,
+                <>Turn on the main switch above the main extension.</>,
+              ]} />
+            </div>
+
+            <div className="note">
+              <b>To start a run:</b> once both parts are set up, press reset on the
+              sound sensor first, then turn on the main switch for the stepper motor.
             </div>
           </article>
 
           {/* Web application */}
-          <article className="card">
+          <article className="card wide">
             <div className="card-head">
-              <span className="card-icon">
-                <Globe size={20} strokeWidth={2} />
-              </span>
+              <span className="card-icon"><Globe size={20} strokeWidth={2} /></span>
               <h2>Web application</h2>
-              <span className="tag">HOSTED</span>
+              <span className="tag">Browser</span>
             </div>
             <p className="lead">
-              Use the deployed app for the live dashboard with your team&apos;s saved data —
-              no setup needed, just sign in from any browser.
+              Turns the uploaded scan into a digital twin of the room and recommends
+              how to treat it.
             </p>
 
-            <ol className="steps">
-              <li>
-                <span className="num">1</span>
-                <span className="stepbody">Open the app URL below and sign in with your work email.</span>
-              </li>
-              <li>
-                <span className="num">2</span>
-                <span className="stepbody">
-                  Pick your workspace, then land on the <b>Dashboard</b>.
-                </span>
-              </li>
-              <li>
-                <span className="num">3</span>
-                <span className="stepbody">
-                  Read live results and browse past runs under <b>History</b>.
-                </span>
-              </li>
-              <li>
-                <span className="num">4</span>
-                <span className="stepbody">
-                  Invite teammates from <b>Team</b> so everyone shares the same data.{" "}
-                  <span className="sub">Edits sync automatically.</span>
-                </span>
-              </li>
-            </ol>
-
-            <div className="link-row">
-              <Link2 size={16} strokeWidth={2} color="#b06cf0" />
-              <a href="https://app.vibra.io" target="_blank" rel="noopener noreferrer">
-                app.vibra.io
-              </a>
-              <button className="copy" onClick={copyUrl}>
-                Copy
-              </button>
-            </div>
+            <Steps items={[
+              <>Open the <b>Parameters Table</b> page.</>,
+              <>Click <b>Import</b>, then <b>Import cloud (Google Sheets)</b> to fetch the latest values from the database.</>,
+              <>Click <b>Deploy</b> to build the digital twin from the detected values.</>,
+              <>On the <b>Simulation</b> page, turn on <b>Imbalanced sound</b> to see where hotspots and deadspots were detected in the room.</>,
+              <>Scroll down to the <b>Recommendations</b> and pick the best option for the room.</>,
+              <>
+                Apply that treatment in the real room, then scan it again and deploy the new
+                values. <span className="sub">The twin shows whether the room is now treated.</span>
+              </>,
+            ]} />
           </article>
+
         </section>
 
         <p className="footnote">
-          <b>Not sure which to use?</b> Reach for the web application day to day. Run the
-          prototype only when you need to tinker locally without touching shared data.
+          <b>Order of use:</b> scan the room with both prototypes and upload the data to
+          Google Sheets first. The web application can only show what is already in the sheet.
         </p>
       </div>
     </>

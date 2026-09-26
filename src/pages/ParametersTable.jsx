@@ -10,7 +10,7 @@ const SHEET_ID = "1OaEfDYphqES4umBGZp33KFWuX1GjawaXj5HtRsFNNdc";
 const CLOUD_TABS = ["Room", "Obstacle", "Reverberation", "Classification"];
 const gvizUrl = (tab) => `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&headers=1&sheet=${encodeURIComponent(tab)}`;
 const INITIAL_SHEETS = {};
-const TABLE_H = 460; // fixed height of each scan table
+export const TABLE_H = 460; // fixed height of each scan table
 
 /* ---- helpers ---- */
 const numish = (v) => v !== "" && v != null && !isNaN(parseFloat(v)) && isFinite(v);
@@ -117,7 +117,7 @@ const isPhysical = (g) => g === "dimensions" || g === "obstacles";
    timestamp / time / date column. A column named "timestamp" is tried first,
    and numeric cells are skipped so a value like an RT60 "time" of 0.45 s can't
    be mistaken for a date. Returns the cell as written in the sheet, or null. */
-function acousticTs(sheet) {
+export function acousticTs(sheet) {
   if (!sheet?.columns?.length) return null;
   const cands = sheet.columns
     .map((c, i) => [String(c), i])
@@ -136,7 +136,7 @@ function acousticTs(sheet) {
   return null;
 }
 
-function acousticView(raw) {
+export function acousticView(raw) {
   if (!raw) return { columns: [], rows: [], lists: [], mode: "empty" };
   const sheet = pruneEmptyCols(raw);
   const lists = sheet.columns
@@ -214,11 +214,11 @@ function gridProblem(grid, text, name) {
  * by an X/Y pair. Anything missing here surfaces downstream as an empty
  * spot layer in Simulation, so it is caught and named at the table.
  * ================================================================== */
-const RX_CLASS_COL = /class|label|zone|category|status|spot/i;
+export const RX_CLASS_COL = /class|label|zone|category|status|spot/i;
 const RX_ANGLE_COL = /^\s*(angle|bearing|azimuth|heading|deg)/i;
 const RX_X_COL = /^\s*(x|x_m|x_mm|x_pos|pos_x|coord_x|x_coord)\s*$/i;
 const RX_Y_COL = /^\s*(y|y_m|y_mm|y_pos|pos_y|coord_y|y_coord)\s*$/i;
-const RX_METRIC_COL = /rt60|reverb|spl|level|db|energy|score|intensity/i;
+export const RX_METRIC_COL = /rt60|reverb|spl|level|db|energy|score|intensity/i;
 const KNOWN_CLASS = /neutral|balanced|normal|nominal|within|ok|hot|high|live|bright|excess|dead|low|dull|null|quiet/i;
 
 const findCol = (cols, re) => cols.findIndex((c) => re.test(String(c)));
@@ -227,7 +227,7 @@ const rowRef = (list) => {
   return list.length > 6 ? `${shown} +${list.length - 6} more` : shown;
 };
 
-function auditClassification(sheet) {
+export function auditClassification(sheet) {
   if (!sheet) return null;
   const cols = sheet.columns || [];
   const rows = sheet.rows || [];
@@ -618,8 +618,8 @@ ${sections.map(sectionHtml).join("")}
   return (
     <div className="vwrap">
       <div className="vhead">
-        <h1>Parameters table</h1>
-        <p className="sub">One room scan at a time — LiDAR physical scan and sound-sensor acoustic scan, side by side.</p>
+        <h1>Parameters Table</h1>
+        <p className="sub">The current room scan, with LiDAR measurements of the room and sound sensor readings of its acoustics shown together.</p>
       </div>
 
       {/* toolbar */}
@@ -707,7 +707,7 @@ ${sections.map(sectionHtml).join("")}
 }
 
 /* ---- sensor section ---- */
-function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sheets, table, hasSheets, session, acoustic = false, emptyHint, audit = null, when = null, whenMissing = "" }) {
+export function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sheets, table, hasSheets, session, acoustic = false, emptyHint, audit = null, when = null, whenMissing = "", bodyH = null }) {
   const activeSheet = sheets[activeId];
   const errs = audit?.errors || [];
   const warns = audit?.warnings || [];
@@ -772,9 +772,9 @@ function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sh
       )}
 
       {acoustic && table.lists?.length > 0 ? (
-        <ParamColumns lists={table.lists} />
+        <ParamColumns lists={table.lists} bodyH={bodyH} />
       ) : (
-      <ScanTable columns={table.columns} rows={table.rows} mode={table.mode} packLeft={acoustic}
+      <ScanTable columns={table.columns} rows={table.rows} mode={table.mode} packLeft={acoustic} bodyH={bodyH}
         empty={!hasSheets ? "Nothing imported yet." : !activeSheet ? emptyHint : (acoustic ? "No values." : !session ? "No room scan loaded." : (table.mode === "rows" ? "No data for this room scan." : "No values."))} />
       )}
     </section>
@@ -782,19 +782,24 @@ function ScanSection({ variant, icon, title, subtitle, tabs, activeId, onTab, sh
 }
 
 /* ---- table ----
+ * `bodyH` (optional) fixes the body height so rows scroll inside the panel
+ * instead of stretching it, used by the Dashboard.
  * `packLeft` adds a zero-content filler column that soaks up all the leftover
  * width. Without it the table stretches its real columns to fill 100%, which is
  * why dropping the timestamp column left the acoustic values drifting rightward
  * and unevenly spaced. With it, each real column shrinks to its content and the
  * whole set sits flush left. */
-function ScanTable({ columns, rows, mode, empty, packLeft = false }) {
+function ScanTable({ columns, rows, mode, empty, packLeft = false, bodyH = null }) {
   const numericCols = useMemo(() => {
     const sample = rows.slice(0, 60);
     return columns.map((_, i) => { const vals = sample.map((r) => r[i]).filter((v) => v !== "" && v != null); return vals.length > 0 && vals.every(numish); });
   }, [columns, rows]);
   const hug = packLeft && columns.length > 0;
   return (
-    <div className="scan-body thin-scroll">
+    <div
+      className="scan-body thin-scroll"
+      style={bodyH ? { height: bodyH, maxHeight: bodyH, overflowY: "auto" } : undefined}
+    >
       <table className="dtable">
         <thead>
           <tr>
@@ -842,9 +847,12 @@ function ScanTable({ columns, rows, mode, empty, packLeft = false }) {
  * parameter's values. They share the .dtable styles, so headers and rows line
  * up across parameters, and a shorter parameter simply ends — there are no
  * blank cells below or between its values. */
-function ParamColumns({ lists }) {
+function ParamColumns({ lists, bodyH = null }) {
   return (
-    <div className="scan-body thin-scroll">
+    <div
+      className="scan-body thin-scroll"
+      style={bodyH ? { height: bodyH, maxHeight: bodyH, overflowY: "auto" } : undefined}
+    >
       {/* Each parameter takes an equal share of the width (never narrower than
           its content), so the columns fill the panel edge to edge instead of
           bunching left and leaving an empty band on the right. */}

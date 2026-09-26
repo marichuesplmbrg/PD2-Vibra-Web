@@ -1,50 +1,150 @@
-import React from "react";
-import { Download, Waves, TrendingDown } from "lucide-react";
+import React, { useMemo, useState, useEffect } from "react";
+import { Download, Ruler, Box, Volume2, Flame, VolumeX, Timer } from "lucide-react";
 
 import { CONFIG, fmt } from "../config.js";
 import { useRoomData } from "../data/useRoomData.jsx";
 import { exportDashboardPdf } from "../lib/exportDashboardPdf.js";
 import SimulationPage from "./Simulation.jsx";
+import { vibraHistory } from "./vibraHistory";
+import {
+  acousticTs,
+  RX_CLASS_COL,
+  RX_METRIC_COL,
+} from "./ParametersTable.jsx";
 
 
 /* -------------------------------------------------------
    Helpers
+   Every value shown on this page comes from the fetched
+   sheet data. Nothing falls back to a sample or a default:
+   a missing value is shown as "—" so it is never mistaken
+   for a real reading.
 ------------------------------------------------------- */
 
-const bandText = (band) => {
-  if (band === "in") return "in target";
-  if (band === "below") return "below target";
-  if (band === "above") return "above target";
-  return `${band} target`;
-};
+const MISSING = "—";
+
+const has = (v) =>
+  v !== null &&
+  v !== undefined &&
+  v !== "" &&
+  Number.isFinite(Number(v));
 
 const whenText = (ts) => {
   if (!ts) return null;
 
-  try {
-    return new Date(
-      String(ts).replace(" ", "T")
-    ).toLocaleString();
-  } catch {
-    return ts;
-  }
+  const d = new Date(String(ts).replace(" ", "T"));
+  return Number.isNaN(d.getTime())
+    ? String(ts)
+    : d.toLocaleString();
+};
+
+/* The Parameters Table tab whose label matches, from the deployed bundle. */
+const findTab = (tabs, re) => {
+  const entry = Object.entries(tabs || {}).find(([label]) => re.test(label));
+  if (!entry || !entry[1] || !Array.isArray(entry[1].columns)) return null;
+  return {
+    label: entry[0],
+    columns: entry[1].columns,
+    rows: Array.isArray(entry[1].rows) ? entry[1].rows : [],
+  };
 };
 
 
+/* Summary of the Classification tab. Counts come from the class column and
+   the RT60 figures from the RT60 column, both read straight from the sheet.
+   Labels the Parameters Table doesn't recognise count as neutral, the same
+   rule its audit uses. */
+const RX_HOT = /hot|high|live|bright|excess/i;
+const RX_DEAD = /dead|low|dull|null|quiet/i;
+
+function summarize(sheet) {
+  const empty = { positions: 0, hot: null, neutral: null, dead: null, avg: null, min: null, max: null };
+  if (!sheet || !sheet.columns.length) return empty;
+
+  const cols = sheet.columns.map(String);
+  const ci = cols.findIndex((c) => RX_CLASS_COL.test(c));
+  let mi = cols.findIndex((c) => /rt60/i.test(c));
+  if (mi < 0) mi = cols.findIndex((c) => RX_METRIC_COL.test(c));
+
+  const rows = sheet.rows.filter((r) =>
+    (ci >= 0 && String(r[ci] ?? "").trim() !== "") || (mi >= 0 && has(r[mi]))
+  );
+  if (!rows.length) return empty;
+
+  let hot = null, neutral = null, dead = null;
+  if (ci >= 0) {
+    hot = 0; neutral = 0; dead = 0;
+    rows.forEach((r) => {
+      const label = String(r[ci] ?? "").replace(/[\s_-]/g, "");
+      if (!label) return;
+      if (RX_HOT.test(label)) hot++;
+      else if (RX_DEAD.test(label)) dead++;
+      else neutral++;
+    });
+  }
+
+  const vals = mi >= 0 ? rows.map((r) => r[mi]).filter(has).map(Number) : [];
+  return {
+    positions: rows.length,
+    hot, neutral, dead,
+    avg: vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null,
+    min: vals.length ? Math.min(...vals) : null,
+    max: vals.length ? Math.max(...vals) : null,
+  };
+}
+
+/* Guarded: a missing or malformed deployment must never crash the page. */
+const readDeployment = () => {
+  try {
+    return typeof vibraHistory?.getDeployment === "function"
+      ? vibraHistory.getDeployment() ?? null
+      : null;
+  } catch (err) {
+    console.error("Dashboard: could not read deployment", err);
+    return null;
+  }
+};
+
 /* -------------------------------------------------------
    Dashboard
+   Panels: Room twin · Acoustic scan · Spatial status
 ------------------------------------------------------- */
 
 export default function Dashboard() {
   const data = useRoomData();
   const c = CONFIG.colors;
 
+  /* The scan deployed from the Parameters Table. Followed live, so a new
+     deploy or a reset updates this page the same way it updates Simulation. */
+  const [dep, setDep] = useState(readDeployment);
+  useEffect(() => {
+    if (typeof vibraHistory?.onDeploy !== "function") return undefined;
+    return vibraHistory.onDeploy((payload) => setDep(payload ?? null));
+  }, []);
+
+  /* Acoustic scan: a summary of the deployed Classification tab. The scan
+     time comes from the Reverberation tab, same as on the Parameters Table. */
+  const acoustic = useMemo(() => {
+    const tabs = dep?.tabs ?? null;
+    const cls = findTab(tabs, /class/i);
+    const rev = findTab(tabs, /reverb/i);
+    return {
+      summary: summarize(cls),
+      when: acousticTs(rev),
+    };
+  }, [dep]);
+
+  const classRows = acoustic.summary.positions;
+
+  /* Nothing deployed yet — the page stays blank. */
+  if (!dep) return <BlankDashboard />;
+
   /* Loading */
   if (data.loading) {
     return (
       <div className="page">
         <p className="panel-sub">
-          Loading scan…
+          Fetching scan from the sheet…
         </p>
       </div>
     );
@@ -67,17 +167,25 @@ export default function Dashboard() {
     );
   }
 
-  const {
-    room,
-    rt60,
-    scan,
-    qualified,
-    band,
-    coverage,
-    roomTs,
-  } = data;
+  const room = data.room ?? {};
+  const scan = data.scan ?? {};
+  const when = whenText(data.roomTs);
 
-  const when = whenText(roomTs);
+
+  const hasRoom = ["width", "length", "height", "area", "volume"]
+    .some((k) => has(room[k]));
+
+  /* Deployed, but none of its values came through — still blank. */
+  if (!hasRoom && !classRows) return <BlankDashboard />;
+
+  /* Header meta — only what was actually fetched */
+  const meta = [
+    when ? `Last scan ${when}` : "Scan time not recorded",
+    has(scan.points)
+      ? `${Number(scan.points).toLocaleString()} points`
+      : null,
+    scan.device || null,
+  ].filter(Boolean);
 
 
   return (
@@ -89,16 +197,10 @@ export default function Dashboard() {
 
       <div className="pagehead">
         <div>
-          <h1>Room analysis</h1>
+          <h1>Room Analysis</h1>
 
           <p className="sub">
-            {when
-              ? `Last scan ${when}`
-              : "Sample scan"}
-            {" · "}
-            {scan.points.toLocaleString()} points
-            {" · "}
-            {scan.device}
+            {meta.join(" · ")}
           </p>
         </div>
 
@@ -113,90 +215,7 @@ export default function Dashboard() {
 
 
       {/* -------------------------------------------------
-          Top statistics
-      ------------------------------------------------- */}
-
-      <div className="dash-top">
-
-        <Stat
-          label="ROOM VOLUME"
-          value={fmt(room.volume, 1)}
-          unit="m³"
-          status="from scan"
-          statusColor={c.ok}
-        />
-
-        <Stat
-          label="FLOOR AREA"
-          value={fmt(room.area)}
-          unit="m²"
-          status="fitted"
-          statusColor={c.ok}
-        />
-
-
-        {/* Qualification */}
-
-        <div className="card">
-
-          <div className="qual-head">
-            <div className="q-title">
-              Qualification
-            </div>
-
-            <div className="q-sub">
-              Against target for this room
-            </div>
-          </div>
-
-
-          <div className="qual-body">
-
-            <div>
-              <div
-                className="qual-verdict"
-                style={{
-                  color: qualified
-                    ? c.ok
-                    : c.warn,
-                }}
-              >
-                {qualified
-                  ? "Qualified"
-                  : "Not qualified"}
-              </div>
-
-              <div className="qual-status">
-                <span
-                  className="dot"
-                  style={{
-                    background: qualified
-                      ? c.ok
-                      : c.bad,
-                  }}
-                />
-
-                {qualified
-                  ? "meets target"
-                  : "needs treatment"}
-              </div>
-            </div>
-
-
-            <div className="qual-note">
-              {qualified
-                ? "Measured RT60 is within the target band for this room."
-                : "Measured RT60 is outside the target band. See the recommendations to bring it into range."}
-            </div>
-
-          </div>
-        </div>
-
-      </div>
-
-
-      {/* -------------------------------------------------
-          Room twin + RT60
+          Room twin + Acoustic scan
       ------------------------------------------------- */}
 
       <div className="grid2">
@@ -214,8 +233,7 @@ export default function Dashboard() {
 
             <p className="panel-sub">
               Live scan from the Simulation
-              {" · "}
-              {fmt(room.height)} m ceiling
+              {has(room.height) && ` · ${fmt(Number(room.height))} m ceiling`}
             </p>
 
           </div>
@@ -229,283 +247,94 @@ export default function Dashboard() {
           <div className="legend">
 
             <span>
-              <i
-                className="swatch"
-                style={{
-                  background: c.shell,
-                }}
-              />
+              <i className="swatch" style={{ background: c.shell }} />
               shell
             </span>
 
             <span>
-              <i
-                className="swatch"
-                style={{
-                  background: c.edge,
-                }}
-              />
+              <i className="swatch" style={{ background: c.edge }} />
               edges
             </span>
 
             <span>
-              <i
-                className="swatch"
-                style={{
-                  background: c.hot,
-                }}
-              />
+              <i className="swatch" style={{ background: c.hot }} />
               hot
             </span>
 
             <span>
-              <i
-                className="swatch"
-                style={{
-                  background: c.dead,
-                }}
-              />
+              <i className="swatch" style={{ background: c.dead }} />
               dead
             </span>
 
           </div>
 
-
-          <div className="orbit-hint">
-            drag to orbit · scroll to zoom
-          </div>
-
         </div>
 
 
-        {/* RT60 */}
+        {/* Acoustic scan — summary of the Classification tab */}
 
-        <div className="card">
+        <section className="sp">
 
-          <h3 className="panel-title">
-            Reverberation (RT60)
-          </h3>
+          <div className="sp-head">
+            <span className="ic"><Volume2 size={16} color="var(--cyan)" /></span>
 
-          <p className="panel-sub">
-            Measured against target band
-          </p>
-
-
-          <div className="rt-head">
-
-            <div className="rt-value">
-              {fmt(rt60.measured)}
-              <small>s</small>
+            <div className="h">
+              <div className="sp-title">Acoustic scan</div>
+              <div className="sp-sub">
+                {acoustic.summary.positions
+                  ? `Summary of ${acoustic.summary.positions} classified position${acoustic.summary.positions === 1 ? "" : "s"}`
+                  : "No classification data in the deployed scan"}
+              </div>
             </div>
 
-            <div className="rt-band">
-
-              <span
-                className="dot"
-                style={{
-                  background: qualified
-                    ? c.ok
-                    : c.bad,
-                }}
-              />
-
-              {bandText(band)}
-
-            </div>
-
+            {acoustic.when && (
+              <span className="sp-when">Acoustic scan · {acoustic.when}</span>
+            )}
           </div>
 
-
-          <Rt60Bar
-            measured={rt60.measured}
-          />
-
-
-          <p className="rt-note">
-
-            Measured RT60 sits{" "}
-            {band === "in"
-              ? "within"
-              : band}{" "}
-
-            {band !== "in"
-              ? "the"
-              : ""}{" "}
-
-            <b>
-              {fmt(CONFIG.target.low)}
-              –
-              {fmt(CONFIG.target.high)} s
-            </b>{" "}
-
-            target band.{" "}
-
-            {band === "below"
-              ? "The room is over-damped — easing off absorption will bring it up."
-              : "Adding absorption will pull it down into range."}
-
-          </p>
-
-
-          {/* Room dimensions */}
-
-          <div className="dims">
-
-            <div className="dim">
-              <label>Width</label>
-              <div>
-                {fmt(room.width)} m
-              </div>
-            </div>
-
-            <div className="dim">
-              <label>Length</label>
-              <div>
-                {fmt(room.length)} m
-              </div>
-            </div>
-
-            <div className="dim">
-              <label>Height</label>
-              <div>
-                {fmt(room.height)} m
-              </div>
-            </div>
-
-            <div className="dim">
-              <label>Area</label>
-              <div>
-                {fmt(room.area)} m²
-              </div>
-            </div>
-
+          <div className="sp-grid">
+            <Cell icon={<Flame size={16} color={c.hot} />} label="Hot spots" value={acoustic.summary.hot} />
+            <Cell icon={<VolumeX size={16} color={c.dead} />} label="Dead spots" value={acoustic.summary.dead} />
           </div>
 
-        </div>
+          {/* Lowest and highest side by side, average across the full width below */}
+          <div className="sp-grid">
+            <Cell icon={<Timer size={16} color="var(--violet)" />} label="Lowest RT60" value={acoustic.summary.min} unit="s" digits={2} />
+            <Cell icon={<Timer size={16} color="var(--violet)" />} label="Highest RT60" value={acoustic.summary.max} unit="s" digits={2} />
+            <Cell icon={<Timer size={16} color="var(--violet)" />} label="Average RT60" value={acoustic.summary.avg} unit="s" digits={2} wide />
+          </div>
+
+        </section>
 
       </div>
 
 
       {/* -------------------------------------------------
-          Recommendations + Coverage
+          Spatial status — same panel as the Parameters Table
       ------------------------------------------------- */}
 
-      <div className="grid2">
+      <section className="sp">
 
+        <div className="sp-head">
+          <span className="ic"><Ruler size={16} color="var(--violet)" /></span>
 
-        {/* Recommendations */}
-
-        <div className="card">
-
-          <h3 className="panel-title">
-            Recommendations
-          </h3>
-
-          <p className="panel-sub">
-            Treatment plan to bring RT60 into target
-          </p>
-
-
-          {CONFIG.recommendations.map((recommendation, index) => (
-
-            <div
-              className="rec-item"
-              key={index}
-            >
-
-              <div className="rec-ic">
-                <Waves size={16} />
-              </div>
-
-
-              <div className="rec-body">
-
-                <div className="t">
-                  {recommendation.title}
-                </div>
-
-                <div className="n">
-                  {recommendation.note}
-                </div>
-
-              </div>
-
-
-              {typeof recommendation.delta === "number" && (
-
-                <div className="rec-delta">
-
-                  <TrendingDown size={14} />
-
-                  {fmt(recommendation.delta)} s
-
-                </div>
-
-              )}
-
-            </div>
-
-          ))}
-
-        </div>
-
-
-        {/* Scan coverage */}
-
-        <div className="card">
-
-          <h3 className="panel-title">
-            Scan coverage
-          </h3>
-
-          <p className="panel-sub">
-            Walls seen by the LiDAR sweep
-          </p>
-
-
-          {["N", "E", "S", "W"].map((direction) => (
-
-            <div
-              className="cov-row"
-              key={direction}
-            >
-
-              <div className="cov-lbl">
-                {direction}
-              </div>
-
-
-              <div className="cov-track">
-
-                <div
-                  className="cov-fill"
-                  style={{
-                    width: `${
-                      coverage?.[direction] ?? 0
-                    }%`,
-                  }}
-                />
-
-              </div>
-
-
-              <div className="cov-pct">
-                {coverage?.[direction] ?? 0}%
-              </div>
-
-            </div>
-
-          ))}
-
-
-          <div className="cov-foot">
-            Higher coverage means the fitted rectangle
-            matches the real walls more closely.
+          <div className="h">
+            <div className="sp-title">Spatial status</div>
+            <div className="sp-sub">Room dimensions from the LiDAR scan</div>
           </div>
 
+          {data.roomTs && (
+            <span className="sp-when">Room scan · {data.roomTs}</span>
+          )}
         </div>
 
-      </div>
+        <div className="sp-grid">
+          <Dim icon={<MoveH />} label="Width" value={room.width} />
+          <Dim icon={<MoveV />} label="Length" value={room.length} />
+          <Dim icon={<Box size={16} color="var(--orange)" />} label="Height" value={room.height} />
+        </div>
+
+      </section>
 
     </div>
   );
@@ -513,137 +342,55 @@ export default function Dashboard() {
 
 
 /* -------------------------------------------------------
-   Stat card
+   Spatial status cell — matches ParametersTable.jsx
 ------------------------------------------------------- */
 
-function Stat({
-  label,
-  value,
-  unit,
-  valueColor,
-  status,
-  statusColor,
-}) {
+function Dim({ icon, label, value }) {
   return (
-    <div className="card">
-
-      <div className="stat-label">
-        {label}
+    <div className="sp-dim">
+      <div className="lbl">{icon}<span>{label}</span></div>
+      <div className="val">
+        {has(value)
+          ? Number(value).toLocaleString(undefined, { maximumFractionDigits: 3 })
+          : MISSING}
+        <small>m</small>
       </div>
+    </div>
+  );
+}
 
+const MoveH = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--orange)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8 22 12 18 16"/><path d="M6 8 2 12 6 16"/><path d="M2 12h20"/></svg>);
+const MoveV = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--orange)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m8 18 4 4 4-4"/><path d="m8 6 4-4 4 4"/><path d="M12 2v20"/></svg>);
 
-      <div
-        className="stat-value"
-        style={
-          valueColor
-            ? { color: valueColor }
-            : undefined
-        }
-      >
-        {value}
-
-        {unit && (
-          <span className="stat-unit">
-            {unit}
-          </span>
-        )}
+/* Summary cell — same markup as Dim, with any unit (or none, for counts). */
+function Cell({ icon, label, value, unit = "", digits = 0, wide = false }) {
+  return (
+    <div className="sp-dim" style={wide ? { gridColumn: "1 / -1" } : undefined}>
+      <div className="lbl">{icon}<span>{label}</span></div>
+      <div className="val">
+        {has(value)
+          ? Number(value).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })
+          : MISSING}
+        {unit && <small>{unit}</small>}
       </div>
-
-
-      <div className="stat-status">
-
-        <span
-          className="dot"
-          style={{
-            background: statusColor,
-          }}
-        />
-
-        {status}
-
-      </div>
-
     </div>
   );
 }
 
 
 /* -------------------------------------------------------
-   RT60 bar
+   Blank state — shown until a scan with values is deployed
 ------------------------------------------------------- */
 
-function Rt60Bar({ measured }) {
-  const {
-    low,
-    high,
-    scaleMax,
-  } = CONFIG.target;
-
-
-  const pct = (value) =>
-    Math.max(
-      0,
-      Math.min(
-        100,
-        (value / (scaleMax || 1)) * 100
-      )
-    );
-
-
+function BlankDashboard() {
   return (
-    <div className="rtbar-wrap">
-
-      <div className="rtbar-track">
-
-        <div
-          className="rtbar-band"
-          style={{
-            left: `${pct(low)}%`,
-            width: `${pct(high) - pct(low)}%`,
-          }}
-        />
-
-
-        <div
-          className="rtbar-fill"
-          style={{
-            width: `${pct(measured)}%`,
-          }}
-        />
-
-
-        <div
-          className="rtbar-marker"
-          style={{
-            left: `${pct(measured)}%`,
-          }}
-        />
-
+    <div className="page">
+      <div className="pagehead">
+        <div>
+          <h1>Room Analysis</h1>
+          <p className="sub">No room scan deployed yet</p>
+        </div>
       </div>
-
-
-      <div className="rtbar-scale">
-
-        <span>
-          0
-        </span>
-
-        <span>
-          {fmt(
-            (scaleMax || 1) / 2,
-            1
-          )}
-        </span>
-
-        <span>
-          {fmt(
-            scaleMax || 1,
-            1
-          )} s
-        </span>
-
-      </div>
-
     </div>
   );
 }
