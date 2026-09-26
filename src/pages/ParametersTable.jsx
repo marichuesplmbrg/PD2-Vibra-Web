@@ -1,8 +1,8 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
 import {
-  Table2, ChevronDown, Upload, Download, Rocket, Cloud, HardDrive, Check,
+  Table2, ChevronDown, Upload, Download, Rocket, Cloud, Check,
   Ruler, Box, AlertCircle, Clock, Save, RotateCcw, Radar, Volume2,
-  AlertTriangle, X,
+  AlertTriangle, X, FileSpreadsheet, FileText,
 } from "lucide-react";
 import { vibraHistory } from "./vibraHistory";
 
@@ -150,24 +150,41 @@ export function acousticView(raw) {
 /* ================================================================== *
  * Local import validation
  * ------------------------------------------------------------------
- * Two separate gates, because a file can pass one and fail the other:
+ * Three gates, because a file can pass one and fail the next:
  *   1. fileTypeProblem  — the name/size the OS reports, checked before
  *      a single byte is read.
- *   2. contentProblem   — what the bytes actually are. An .xlsx renamed
- *      to .csv, a PDF, an HTML error page or a binary blob all arrive
- *      with a perfectly innocent extension, and parseCSV would happily
- *      turn any of them into a table of garbage.
+ *   2. byte sniff       — decides HOW the file is read, whatever its
+ *      extension says. A zip (.xlsx) or OLE (.xls) signature goes to the
+ *      workbook reader; anything else is decoded as text and checked by
+ *      contentProblem, which catches PDFs, HTML error pages and binary
+ *      blobs that arrive with an innocent extension.
+ *   3. gridProblem      — structural checks, run once per table.
+ *
+ * One file can carry all four scan tables, in either form:
+ *   - an .xlsx with tabs named Room / Obstacle / Reverberation /
+ *     Classification (e.g. the Google Sheet downloaded as .xlsx);
+ *   - a single CSV split into sections, each opened by a marker line:
+ *         [Room]
+ *         timestamp,N_m,E_m,...
+ *         2026-09-25 11:10:49,0.209,...
+ *
+ *         [Obstacle]
+ *         ...
+ * Tables are labelled with their tab / section name, the same labels the
+ * cloud import uses, so they group, link and deploy exactly like a
+ * Google Sheets import. A plain CSV with no markers is still one table.
  * ================================================================== */
 const CSV_EXT = /\.(csv|tsv|txt)$/i;
+const BOOK_EXT = /\.(xlsx|xls)$/i;
 const MAX_IMPORT_MB = 8;
 
 function fileTypeProblem(file) {
   const name = file.name || "(unnamed file)";
   const ext = (name.match(/\.[^.\\/]+$/) || [""])[0];
-  if (!CSV_EXT.test(name)) {
+  if (!CSV_EXT.test(name) && !BOOK_EXT.test(name)) {
     return ext
-      ? `Wrong file type — “${name}” is a ${ext.slice(1).toUpperCase()} file. Import local expects a .csv exported from the scan sheet.`
-      : `Wrong file type — “${name}” has no file extension. Import local expects a .csv exported from the scan sheet.`;
+      ? `Wrong file type — “${name}” is a ${ext.slice(1).toUpperCase()} file. Import local expects a .csv or .xlsx exported from the scan sheet.`
+      : `Wrong file type — “${name}” has no file extension. Import local expects a .csv or .xlsx exported from the scan sheet.`;
   }
   if (file.size === 0) return `“${name}” is empty (0 bytes) — nothing to import.`;
   if (file.size > MAX_IMPORT_MB * 1024 * 1024)
@@ -175,35 +192,81 @@ function fileTypeProblem(file) {
   return null;
 }
 
+const isZip = (b) => b.length > 3 && b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04;
+const isOle = (b) => b.length > 7 && b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0;
+
 function contentProblem(text, name) {
   const head = String(text).slice(0, 2048);
-  if (/^PK\x03\x04/.test(head))
-    return `Wrong file type — “${name}” is a spreadsheet/zip archive (.xlsx or .zip) renamed to .csv. Open it and use File → Download → Comma-separated values.`;
-  if (/^%PDF/.test(head)) return `Wrong file type — “${name}” is a PDF, not CSV text.`;
+  if (/^%PDF/.test(head)) return `Wrong file type — “${name}” is a PDF, not CSV text. Export PDF makes a printable report; import the .csv or .xlsx instead.`;
   if (/^\s*<(\?xml|!doctype|html)/i.test(head))
     return `Wrong file type — “${name}” is an HTML/XML document, not CSV text. If it came from a share link, the server returned a web page instead of the sheet.`;
   if (/^\s*[[{]/.test(head) && !head.includes(","))
     return `Wrong file type — “${name}” looks like JSON, not CSV.`;
   const junk = (head.match(/[\u0000-\u0008\u000E-\u001F\uFFFD]/g) || []).length;
   if (junk > head.length * 0.02)
-    return `“${name}” isn't readable as text — it looks like a binary file that was renamed to .csv.`;
+    return `“${name}” isn't readable as text or as a spreadsheet — it looks like a binary file with a .csv/.xlsx name.`;
   return null;
 }
 
 /* Structural checks that only make sense once the grid exists. */
-function gridProblem(grid, text, name) {
-  if (!grid.length) return { kind: "err", msg: `“${name}” contains no rows — the file is blank or only whitespace.` };
+function gridProblem(grid, name) {
+  if (!grid.length) return { kind: "err", msg: `“${name}” contains no rows — it is blank or only whitespace.` };
   const [header, ...body] = grid;
   if (!header.some((c) => c !== "")) return { kind: "err", msg: `“${name}” has no header row — the first line must name the columns.` };
   if (!body.length) return { kind: "err", msg: `“${name}” has a header row but no data rows beneath it.` };
-  const firstLine = String(text).split("\n")[0] || "";
-  if (header.length === 1 && /[;\t|]/.test(firstLine))
-    return { kind: "err", msg: `“${name}” isn't comma-separated — it uses ${/\t/.test(firstLine) ? "tabs" : /;/.test(firstLine) ? "semicolons" : "pipes"}. Re-export with commas as the delimiter.` };
+  if (header.length === 1 && /[;\t|]/.test(header[0]))
+    return { kind: "err", msg: `“${name}” isn't comma-separated — it uses ${/\t/.test(header[0]) ? "tabs" : /;/.test(header[0]) ? "semicolons" : "pipes"}. Re-export with commas as the delimiter.` };
   const blankHead = header.filter((c) => c === "").length;
   if (blankHead) return { kind: "warn", msg: `Imported “${name}”, but ${blankHead} column${blankHead > 1 ? "s have" : " has"} no header name — those columns can't be matched to a parameter.` };
   const ragged = body.filter((r) => r.length !== header.length).length;
   if (ragged) return { kind: "warn", msg: `Imported “${name}”, but ${ragged} row${ragged > 1 ? "s don't" : " doesn't"} match the ${header.length}-column header — values may be shifted.` };
   return null;
+}
+
+/* Sectioned CSV: split one parsed grid at its [Tab] marker rows.
+   Returns null when the file has no markers (a plain single-table CSV). */
+const SECTION_RX = /^\[(.+)\]$/;
+function splitSections(grid) {
+  if (!grid.length || !SECTION_RX.test(String(grid[0][0] ?? "").trim())) return null;
+  const tabs = [];
+  let cur = null;
+  grid.forEach((row) => {
+    const m = String(row[0] ?? "").trim().match(SECTION_RX);
+    if (m && row.slice(1).every((c) => c === "")) { cur = { tab: m[1].trim(), grid: [] }; tabs.push(cur); }
+    else if (cur) cur.grid.push(row);
+  });
+  return tabs;
+}
+
+/* Workbook: every tab becomes a grid of strings, the same shape parseCSV
+   returns, so everything downstream treats .xlsx and .csv identically.
+   Numbers keep full precision (not the cell's display rounding); cells
+   formatted as dates are written as "m/d/yyyy h:mm:ss", the form parseTs
+   and the Google Sheet already use. SheetJS is loaded only when a
+   workbook is actually imported. */
+async function workbookTabs(buf) {
+  const mod = await import("xlsx");
+  const XLSX = mod.SSF ? mod : mod.default; // ESM build vs CommonJS interop
+  const wb = XLSX.read(buf, { type: "array", cellNF: true, cellText: true });
+  const cellText = (cell) => {
+    if (!cell || cell.v == null || cell.t === "e" || cell.t === "z") return "";
+    if (cell.t === "n" && cell.z && XLSX.SSF.is_date(cell.z)) return XLSX.SSF.format("m/d/yyyy h:mm:ss", cell.v);
+    if (cell.t === "n") return String(cell.v);
+    if (cell.t === "b") return cell.v ? "TRUE" : "FALSE";
+    return String(cell.w ?? cell.v).trim();
+  };
+  return wb.SheetNames.map((tab) => {
+    const ws = wb.Sheets[tab];
+    if (!ws || !ws["!ref"]) return { tab, grid: [] };
+    const r = XLSX.utils.decode_range(ws["!ref"]);
+    const grid = [];
+    for (let R = r.s.r; R <= r.e.r; R++) {
+      const row = [];
+      for (let C = r.s.c; C <= r.e.c; C++) row.push(cellText(ws[XLSX.utils.encode_cell({ r: R, c: C })]));
+      if (row.some((c) => c !== "")) grid.push(row);
+    }
+    return { tab, grid };
+  });
 }
 
 /* ================================================================== *
@@ -326,7 +389,8 @@ export default function ParametersTable({ onSave } = {}) {
   const [cloudBusy, setCloudBusy] = useState(false);
   const [resetArmed, setResetArmed] = useState(false);
   const [importIssue, setImportIssue] = useState(null); // { kind: "err"|"warn", msg }
-  const fileRef = useRef(null);
+  const csvRef = useRef(null);  // file picker filtered to CSV
+  const xlsxRef = useRef(null); // file picker filtered to Excel workbooks
 
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(null), 3400); return () => clearTimeout(t); }, [toast]);
 
@@ -405,6 +469,59 @@ export default function ParametersTable({ onSave } = {}) {
    * -------------------------------------------------------------------- */
   const failImport = (msg) => { setToast({ kind: "err", msg }); setImportIssue({ kind: "err", msg }); };
 
+  /* Put the parsed tables into the working set. A table that carries a tab
+     name (from an .xlsx tab or a [Tab] section) replaces any loaded table
+     with the same label — cloud or local — so the page always holds one
+     Room, one Obstacle, etc. A plain CSV is added alongside, as before. */
+  const commitTabs = (tabs, fileName) => {
+    const base = fileName.replace(/\.(csv|tsv|txt|xlsx|xls)$/i, "");
+    const accepted = [], issues = [], skipped = [];
+    tabs.forEach(({ tab, grid }) => {
+      if (tab && !grid.length) { skipped.push(tab); return; } // e.g. an empty scratch tab
+      const where = tab ? `${fileName} › ${tab}` : fileName;
+      const pruned = gridToSheet(grid);
+      const g = pruned.columns.length ? [pruned.columns, ...pruned.rows] : [];
+      const problem = gridProblem(g, where);
+      if (problem) issues.push(problem);
+      if (problem?.kind !== "err") accepted.push({ tab, ...pruned });
+    });
+
+    if (!accepted.length) {
+      failImport(issues.length ? issues.map((i) => i.msg).join(" ") : `“${fileName}” has no tables with data.`);
+      return;
+    }
+
+    setSheets((p) => {
+      const next = { ...p };
+      accepted.forEach(({ tab, columns, rows, unnamed }) => {
+        const extra = unnamed ? { unnamed } : {};
+        if (tab) {
+          Object.keys(next).forEach((k) => { if (String(next[k].label).toLowerCase() === tab.toLowerCase()) delete next[k]; });
+          next[`local-${tab}`] = { label: tab, source: "local", columns, rows, ...extra };
+        } else {
+          next[`local-${Date.now()}`] = { label: `Local · ${base}`, source: "local", columns, rows, ...extra };
+        }
+      });
+      return next;
+    });
+
+    const total = accepted.reduce((n, t) => n + t.rows.length, 0);
+    const what = accepted.length > 1 || accepted[0].tab
+      ? `${accepted.length} table${accepted.length === 1 ? "" : "s"} (${total.toLocaleString()} rows)`
+      : `${total.toLocaleString()} row${total === 1 ? "" : "s"}`;
+    const notes = [...issues.map((i) => i.msg)];
+    if (skipped.length) notes.push(`Skipped empty tab${skipped.length > 1 ? "s" : ""}: ${skipped.join(", ")}.`);
+
+    if (issues.length) {
+      const msg = `Imported ${what} from ${fileName}. ${notes.join(" ")}`;
+      setToast({ kind: "err", msg });
+      setImportIssue({ kind: "warn", msg });
+    } else {
+      setImportIssue(null);
+      setToast({ kind: "ok", msg: `Imported ${what} from ${fileName}${skipped.length ? ` · ${notes.join(" ")}` : ""}` });
+    }
+  };
+
   const onLocalFile = (e) => {
     const file = e.target.files?.[0];
     e.target.value = ""; // reset first, so re-picking the same file still fires
@@ -416,33 +533,32 @@ export default function ParametersTable({ onSave } = {}) {
     const reader = new FileReader();
     reader.onerror = () => failImport(`Couldn't read “${file.name}” — ${reader.error?.message || "the file could not be opened"}.`);
     reader.onabort = () => failImport(`Import of “${file.name}” was cancelled before it finished.`);
-    reader.onload = () => {
+    reader.onload = async () => {
       try {
-        const text = String(reader.result ?? "");
-        const contentErr = contentProblem(text, file.name);
-        if (contentErr) { failImport(contentErr); return; }
-
-        const pruned = gridToSheet(parseCSV(text));
-        const grid = pruned.columns.length ? [pruned.columns, ...pruned.rows] : [];
-        const problem = gridProblem(grid, text, file.name);
-        if (problem?.kind === "err") { failImport(problem.msg); return; }
-
-        const { columns, rows, unnamed } = pruned;
-        const id = `local-${Date.now()}`;
-        setSheets((p) => ({ ...p, [id]: { label: `Local · ${file.name.replace(/\.(csv|tsv|txt)$/i, "")}`, source: "local", columns, rows, ...(unnamed ? { unnamed } : {}) } }));
-        if (problem?.kind === "warn") {
-          setToast({ kind: "err", msg: problem.msg });
-          setImportIssue({ kind: "warn", msg: problem.msg });
+        const buf = reader.result;
+        const bytes = new Uint8Array(buf);
+        let tabs;
+        if (isZip(bytes) || isOle(bytes)) {
+          try { tabs = await workbookTabs(buf); }
+          catch (err) {
+            failImport(`“${file.name}” couldn't be opened as a spreadsheet — ${err.message}. Re-save it as .xlsx, or export it as .csv.`);
+            return;
+          }
+          if (!tabs.some((t) => t.grid.length)) { failImport(`“${file.name}” is a workbook, but none of its tabs hold any data.`); return; }
         } else {
-          setImportIssue(null);
-          setToast({ kind: "ok", msg: `Imported ${rows.length} row${rows.length === 1 ? "" : "s"} from ${file.name}` });
+          const text = new TextDecoder("utf-8").decode(bytes);
+          const contentErr = contentProblem(text, file.name);
+          if (contentErr) { failImport(contentErr); return; }
+          const grid = parseCSV(text);
+          tabs = splitSections(grid) || [{ tab: null, grid }];
         }
+        commitTabs(tabs, file.name);
       } catch (err) {
-        failImport(`Couldn't parse “${file.name}” — ${err.message}. Check it is a plain comma-separated export.`);
+        failImport(`Couldn't parse “${file.name}” — ${err.message}. Check it is a comma-separated or .xlsx export of the scan sheet.`);
       }
     };
 
-    try { reader.readAsText(file); }
+    try { reader.readAsArrayBuffer(file); }
     catch (err) { failImport(`Couldn't open “${file.name}” — ${err.message}.`); }
   };
   const importCloud = async () => {
@@ -632,11 +748,16 @@ ${sections.map(sectionHtml).join("")}
           </button>
           {importMenu && (
             <Menu onClose={() => setImportMenu(false)} width={250}>
-              <MenuItem onClick={() => { setImportMenu(false); fileRef.current?.click(); }}><span className="menu-left"><HardDrive size={15} color="var(--orange)" /> Import local (.csv)</span></MenuItem>
+              <MenuItem onClick={() => { setImportMenu(false); csvRef.current?.click(); }}><span className="menu-left"><FileText size={15} color="var(--orange)" /> Import CSV (.csv)</span></MenuItem>
+              <MenuItem onClick={() => { setImportMenu(false); xlsxRef.current?.click(); }}><span className="menu-left"><FileSpreadsheet size={15} color="var(--ok)" /> Import Excel (.xlsx)</span></MenuItem>
               <MenuItem onClick={importCloud}><span className="menu-left"><Cloud size={15} color="var(--violet)" /> Import cloud (Google Sheets)</span></MenuItem>
             </Menu>
           )}
-          <input ref={fileRef} type="file" accept=".csv,text/csv" onChange={onLocalFile} className="file-input" />
+          {/* Two pickers only so each opens with the right file filter. Both
+              feed the same onLocalFile, which reads the bytes and handles a
+              .csv or an .xlsx whichever one was used. */}
+          <input ref={csvRef} type="file" accept=".csv,.tsv,.txt,text/csv" onChange={onLocalFile} className="file-input" />
+          <input ref={xlsxRef} type="file" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" onChange={onLocalFile} className="file-input" />
         </div>
 
         <div className="pt-actions">
