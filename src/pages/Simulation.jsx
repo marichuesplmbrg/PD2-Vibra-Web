@@ -8,8 +8,9 @@ import { vibraHistory } from "./vibraHistory";
 const cssVar = (n, fb) => { try { const v = getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v || fb; } catch { return fb; } };
 const numish = (v) => v !== "" && v != null && !isNaN(parseFloat(v)) && isFinite(v);
 
-// Target RT60 band (seconds). Adjust to your standard / room type.
-const RT60_TARGET = { low: 0.4, high: 0.6 };
+// Target RT60 band (seconds): the recording-studio band VIBRA uses as its
+// neutral reference, the same band the classification is judged against.
+const RT60_TARGET = { low: 0.2, high: 0.4 };
 
 // Billboarded text pill sprite (always faces camera, drawn on top).
 function roundRect(ctx, x, y, w, h, r) {
@@ -325,9 +326,15 @@ function parseDeployment(dep) {
     else centre(spots);
   }
 
-  // average RT60 from a reverberation-style tab, if present
+  // Average RT60 for the recommendations. The Classification tab is read FIRST:
+  // its per-position RT60 values are the ones the hot / dead labels were drawn
+  // from, so the recommendation verdict and the spot markers can't disagree.
+  // Other tabs with an RT60 column (e.g. Reverberation) are only a fallback.
   let rt60 = null;
-  for (const [, t] of Object.entries(tabs)) {
+  const rtTabs = Object.entries(tabs).sort(
+    ([a], [b]) => Number(/class/i.test(b)) - Number(/class/i.test(a))
+  );
+  for (const [, t] of rtTabs) {
     const cols = t.columns || [];
     const ri = colIdx(cols, /rt60/i);
     if (ri >= 0 && (t.rows || []).length) {
@@ -336,7 +343,19 @@ function parseDeployment(dep) {
     }
   }
 
-  return { room, rawPoints, spots, spotsFrom, rt60, roomTs: dep.roomTs, at: dep.at };
+  // Measured frequency bands (Hz) from the Reverberation tab, if it lists them.
+  // Used only to say how thick the absorption must be; never invented.
+  let bands = [];
+  for (const [label, t] of Object.entries(tabs)) {
+    if (!/reverb/i.test(label)) continue;
+    const fi = colIdx(t.columns || [], /freq|hz|band/i);
+    if (fi < 0) continue;
+    bands = [...new Set((t.rows || []).map((r) => parseFloat(r[fi])).filter((v) => Number.isFinite(v) && v > 0))]
+      .sort((a, b) => a - b);
+    if (bands.length) break;
+  }
+
+  return { room, rawPoints, spots, spotsFrom, rt60, bands, roomTs: dep.roomTs, at: dep.at };
 }
 
 /* ================================================================== *
@@ -545,6 +564,7 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
   const mountRef = useRef(null);
   const three = useRef(null);
   const spotsRef = useRef([]); // pickable spot meshes for hover
+  const scaledRef = useRef({}); // which prototypes were shrunk to fit the room
   const orbit = useRef({ theta: Math.PI * 0.28, phi: Math.PI * 0.34, radius: 12, home: 12, target: new THREE.Vector3(0, 1, 0) });
   const autoRef = useRef(true);
   useEffect(() => { autoRef.current = orbiting; }, [orbiting]);
@@ -928,8 +948,14 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
       const devH = (bb.max.y - bb.min.y) || 1;
       const devFoot = Math.max(bb.max.x - bb.min.x, bb.max.z - bb.min.z) || 1;
       const devLong = Math.max(devH, bb.max.x - bb.min.x, bb.max.z - bb.min.z) || 1;
-      const s = spec.size / (spec.pin === "long" ? devLong : devH);
-      heights[key] = devH * s; // real standing height, used to frame the camera
+      // True scale first; if that doesn't fit inside the room, shrink it so it
+      // stands within 90% of the room height and 80% of the shorter wall. The
+      // twin labels it "not to scale" whenever this happens.
+      const trueS = spec.size / (spec.pin === "long" ? devLong : devH);
+      const fitS = Math.min((h * 0.9) / devH, (Math.min(w, l) * 0.8) / devFoot);
+      const s = Math.min(trueS, fitS);
+      scaledRef.current[key] = s < trueS;
+      heights[key] = devH * s; // drawn standing height, used to frame the camera
       const ext = (v) => (v * 1000).toFixed(0);
       console.info(
         `[VIBRA] ${DEVICE_NAMES[key]} STL extents (mm, as loaded): ` +
@@ -1024,7 +1050,11 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
             </div>
           )
         )}
-        {hasModel && <div className="sim-hint2">drag to orbit · scroll to zoom</div>}
+        {hasModel && (
+          <div className="sim-hint2">
+            {layers.device && scaledRef.current[activeDevice] ? "prototype not to scale · " : ""}drag to orbit · scroll to zoom
+          </div>
+        )}
         {hover && (
           <div className="sim-tip" style={{ left: hover.sx + 14, top: hover.sy + 14 }}>
             <div className={`hd ${hover.type === "hot" ? "hot" : "dead"}`} style={hover.type === "neutral" ? { color: "var(--sim-neutral)" } : undefined}>
@@ -1101,7 +1131,11 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
                 <div className="small">Open the Parameters table, pick a room scan, and press <b className="ink">Deploy to Simulation</b>.</div>
               </div>
             )}
-            {hasModel && <div className="sim-hint2">drag to orbit · scroll to zoom</div>}
+            {hasModel && (
+          <div className="sim-hint2">
+            {layers.device && scaledRef.current[activeDevice] ? "prototype not to scale · " : ""}drag to orbit · scroll to zoom
+          </div>
+        )}
           </div>
         </section>
 
@@ -1468,7 +1502,7 @@ function AwTable({ plan }) {
       {!plan.feasible && (
         <div style={{ marginTop: 8, fontSize: "0.82em", lineHeight: 1.5, padding: "8px 10px", borderRadius: 8, background: "rgba(255,91,82,0.10)", border: "1px solid rgba(255,91,82,0.30)" }}>
           The required coefficient exceeds αw 1.00, the top of Class A — full-surface treatment alone cannot reach the target.
-          Add volume-based absorption (bass traps, freestanding baffles) or relax the RT60 target.
+          Add absorption inside the room volume, not only on its surfaces, or relax the RT60 target.
         </div>
       )}
     </div>
@@ -1542,18 +1576,105 @@ function SpotAllocTable({ alloc, basis }) {
 // Plain names for the ISO 11654 classes — what a shopper actually weighs.
 const GRADE_NAME = { A: "Best", B: "Very good", C: "Good", D: "Basic" };
 
-// Put an area into something a person can picture. Small rooms get A4 sheets,
-// anything bigger gets standard 60 × 60 cm panels.
-const A4_M2 = 0.21 * 0.297;
-const PANEL_M2 = 0.6 * 0.6;
+// Put an area into a size a person can picture: the side of an equal square.
+// Deliberately names no material or product; only size, grade and thickness.
 function relatableArea(m2) {
   if (!numish(m2) || m2 <= 0) return "";
-  if (m2 < PANEL_M2 * 2) {
-    const n = Math.max(1, Math.ceil(m2 / A4_M2));
-    return `about ${n} sheet${n > 1 ? "s" : ""} of A4 paper`;
+  const side = Math.sqrt(m2);
+  if (side < 1) {
+    const cm = Math.ceil((side * 100) / 5) * 5;
+    return `about the size of a ${cm} × ${cm} cm square`;
   }
-  const n = Math.max(1, Math.ceil(m2 / PANEL_M2));
-  return `about ${n} panel${n > 1 ? "s" : ""} of 60 × 60 cm`;
+  return `about the size of a ${side.toFixed(1)} × ${side.toFixed(1)} m square`;
+}
+
+/* ---- absorber thickness ------------------------------------------------ *
+ * Thicker absorption stops lower sounds. The minimum thickness for a sound of
+ * frequency f is a quarter of its wavelength, λ/4 = c / 4f: in front of a
+ * solid wall the air moves most a quarter wavelength out, so that is where a
+ * porous absorber must reach to work. Shown to users in plain words; the
+ * formula and sources sit under "Technical details" (ThicknessBasis).
+ *   Cox, T. J. & D'Antonio, P. (2016). Acoustic Absorbers and Diffusers:
+ *     Theory, Design and Application (3rd ed.). CRC Press.
+ *   Kuttruff, H. (2016). Room Acoustics (6th ed.). CRC Press.
+ * ----------------------------------------------------------------------- */
+const SPEED_OF_SOUND = 343; // m/s, air at 20 °C
+const THICKNESS_BANDS = [
+  { f: 250,  what: "Deep bass, like drums" },
+  { f: 500,  what: "Low voices and bass notes" },
+  { f: 1000, what: "Most of normal speech" },
+  { f: 2000, what: "Crisp speech sounds" },
+  { f: 4000, what: "Hiss and sharp \"s\" sounds" },
+];
+const quarterWaveMm = (f) => Math.ceil(((SPEED_OF_SOUND / (4 * f)) * 1000) / 5) * 5;
+const cmText = (mm) => `${(mm / 10).toLocaleString(undefined, { maximumFractionDigits: 1 })} cm`;
+
+function ThicknessGuide({ bands, room }) {
+  const lowest = bands && bands.length ? bands[0] : null;
+  // The row that covers the lowest band the scan measured (250–4000 Hz).
+  const focus = lowest == null
+    ? null
+    : THICKNESS_BANDS.reduce((best, r) => (r.f <= Math.max(lowest, 250) ? r.f : best), 250);
+  const shortWall = Math.min(room?.w || Infinity, room?.l || Infinity);
+  const tooThick = (f) => Number.isFinite(shortWall) && quarterWaveMm(f) / 1000 > shortWall * 0.25;
+
+  const cell = { padding: "6px 10px", textAlign: "left", verticalAlign: "top" };
+  const head = { ...cell, fontWeight: 600, opacity: 0.7, borderBottom: "1px solid rgba(255,255,255,0.10)", whiteSpace: "nowrap" };
+
+  return (
+    <div style={{ marginTop: 14 }}>
+      <p>
+        <b>How thick?</b> Thicker absorption stops lower sounds.{" "}
+        {focus
+          ? <>Your scan picked up sound as low as {lowest} Hz, so use absorption at least <b>{cmText(quarterWaveMm(focus))}</b> thick.</>
+          : <>Find the lowest sound you want to reduce:</>}
+      </p>
+      <div style={{ overflowX: "auto", maxWidth: "100%" }}>
+        <table style={{ borderCollapse: "collapse", fontSize: "0.9em", maxWidth: 480, width: "100%" }}>
+          <thead>
+            <tr>
+              <th style={head}>To reduce echo in</th>
+              <th style={head}>Use at least</th>
+            </tr>
+          </thead>
+          <tbody>
+            {THICKNESS_BANDS.map(({ f, what }) => (
+              <tr key={f} style={f === focus ? { color: "var(--orange)", fontWeight: 700 } : undefined}>
+                <td style={cell}>
+                  {what}
+                  <span style={{ opacity: 0.55, fontWeight: 400 }}> · {f.toLocaleString()} Hz</span>
+                </td>
+                <td style={{ ...cell, whiteSpace: "nowrap" }}>
+                  {cmText(quarterWaveMm(f))}
+                  {tooThick(f) && <span style={{ opacity: 0.55, fontWeight: 400 }}> · too thick for this room</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* The formula and sources for the thickness table, kept in Technical details. */
+function ThicknessBasis() {
+  return (
+    <div className="rec-cell" style={{ gridColumn: "1 / -1", minWidth: 0 }}>
+      <span className="ic"><Volume2 size={16} color="var(--muted)" /></span>
+      <div style={{ minWidth: 0 }}>
+        <div className="t">Absorber thickness (quarter wavelength)</div>
+        <div className="n">
+          Minimum thickness = λ/4 = c / 4f, with c = 343 m/s. In front of a rigid wall, air particle
+          velocity is zero at the wall and peaks a quarter wavelength out, so a porous absorber must
+          reach that depth to absorb frequency f effectively. Sources: Cox &amp; D'Antonio,{" "}
+          <i>Acoustic Absorbers and Diffusers: Theory, Design and Application</i>, 3rd ed., CRC Press, 2016;
+          Kuttruff, <i>Room Acoustics</i>, 6th ed., CRC Press, 2016. Absorption grades follow
+          ISO 11654:1997, from coefficients measured per ISO 354:2003.
+        </div>
+      </div>
+    </div>
+  );
 }
 const areaText = (m2) => (m2 < 0.1 ? `${(m2 * 10000).toFixed(0)} cm²` : `${m2.toFixed(2)} m²`);
 
@@ -1586,7 +1707,7 @@ function EchoGauge({ rt }) {
 
 function GradePicker({ options, value, onChange }) {
   return (
-    <div className="rg-grades" role="radiogroup" aria-label="Panel grade">
+    <div className="rg-grades" role="radiogroup" aria-label="Absorption grade">
       {options.map((c) => (
         <button
           key={c.cls}
@@ -1644,7 +1765,7 @@ function RecommendationGuide({ model, counts }) {
   const verdict = {
     echoey: {
       tone: "bad", title: "Your room is too echoey",
-      lead: `Sound keeps bouncing around for ${rt.toFixed(1)} seconds before it fades. For clear voices and music it should fade in about half a second — this room holds on ${times >= 1.5 ? `roughly ${times.toFixed(0)}× too long` : "a little too long"}.`,
+      lead: `Sound keeps bouncing around for ${rt.toFixed(1)} seconds before it fades. For clear voices and music it should fade in ${RT60_TARGET.low}–${RT60_TARGET.high} seconds, so this room holds on ${times >= 1.5 ? `roughly ${times.toFixed(0)}× too long` : "a little too long"}.`,
     },
     dead: {
       tone: "cool", title: "Your room sounds too dead",
@@ -1662,11 +1783,11 @@ function RecommendationGuide({ model, counts }) {
   const tips = [];
   if (alloc && !alloc.diffuse) tips.push({
     icon: Target, title: "Where matters more than how much",
-    body: "Sound is uneven across this room, so putting panels in the right spots will do more than buying extra.",
+    body: "Sound is uneven across this room, so placing absorption in the right spots will do more than adding more of it.",
   });
   if (plan && plan.dA > 0) tips.push({
-    icon: Volume2, title: "Deep bass is a separate job",
-    body: "These panels tame echo in voices and most music. If you still hear a boomy low rumble afterwards, thick bass traps in the corners are what fix that.",
+    icon: Volume2, title: "Low frequencies need more thickness",
+    body: "Thin absorption only stops high sounds. If deep sounds still echo, go thicker. See the table above.",
   });
   if (!numish(model.room?.h)) tips.push({
     icon: AlertTriangle, title: "Ceiling height was guessed",
@@ -1686,7 +1807,7 @@ function RecommendationGuide({ model, counts }) {
           <span className="rg-step-num">1</span>
           <div className="rg-step-body">
             <div className="rg-step-title">Keep the room as it is</div>
-            <p>If you add furniture, curtains or panels later, scan again to check the balance still holds.</p>
+            <p>If anything in the room changes, scan again to check the balance still holds.</p>
           </div>
         </div>
       )}
@@ -1698,8 +1819,8 @@ function RecommendationGuide({ model, counts }) {
             <div className="rg-step-title">Bring back some reflection</div>
             <p>
               {plan
-                ? `Take down roughly ${areaText(Math.abs(plan.dA))} of soft panels (${relatableArea(Math.abs(plan.dA))}), or cover the same amount with hard surfaces — wood, a bookshelf, or a diffuser.`
-                : "Take down some soft panels, or add hard surfaces like wood or a bookshelf. Scan the room size to get an exact amount."}
+                ? `Remove roughly ${areaText(Math.abs(plan.dA))} of absorption (${relatableArea(Math.abs(plan.dA))}), or cover the same area with a hard, reflective surface.`
+                : "Remove some absorption, or add a hard, reflective surface. Scan the room size to get an exact amount."}
             </p>
           </div>
         </div>
@@ -1710,22 +1831,22 @@ function RecommendationGuide({ model, counts }) {
           <div className="rg-step">
             <span className="rg-step-num">1</span>
             <div className="rg-step-body">
-              <div className="rg-step-title">Add sound-absorbing panels</div>
+              <div className="rg-step-title">Add sound absorption</div>
               {!plan ? (
-                <p>Scan the room's size so we can work out how many panels you need.</p>
+                <p>Scan the room's size so we can work out how much absorption you need.</p>
               ) : !chosen ? (
                 <p>
-                  Even covering every wall and the ceiling won't be enough here. Add thick, free-standing panels or
-                  bass traps that stand in the room, not just on the walls.
+                  Even covering every wall and the ceiling won't be enough here. The room needs absorption placed
+                  inside the space as well, not only on the walls.
                 </p>
               ) : (
                 <>
-                  <p>Pick a panel grade. Better panels mean fewer of them. The grade is printed on the product as its ISO class.</p>
+                  <p>Pick a quality grade. The better the grade, the less you need. The grade is printed on the product.</p>
                   <GradePicker options={options} value={chosen.cls} onChange={setPick} />
                   <div className="rg-result">
                     <div className="rg-result-big">{areaText(chosen.area)}</div>
                     <div className="rg-result-text">
-                      of <b>{GRADE_NAME[chosen.cls].toLowerCase()} (Class {chosen.cls})</b> panels — {relatableArea(chosen.area)}.
+                      of <b>{GRADE_NAME[chosen.cls].toLowerCase()} (Class {chosen.cls})</b> sound absorption, {relatableArea(chosen.area)}.
                       <span className="rg-result-sub">
                         <ShareBar pct={chosen.pct} /> That covers {chosen.pct < 1 ? "under 1" : chosen.pct.toFixed(0)}% of your walls and ceiling.
                       </span>
@@ -1733,6 +1854,7 @@ function RecommendationGuide({ model, counts }) {
                   </div>
                 </>
               )}
+              {plan && <ThicknessGuide bands={model.bands} room={model.room} />}
             </div>
           </div>
 
@@ -1743,7 +1865,7 @@ function RecommendationGuide({ model, counts }) {
                 <div className="rg-step-title">Put them where it's loudest</div>
                 <p>
                   The scan found {counts.hot} loud spot{counts.hot > 1 ? "s" : ""} — shown in red in the twin above.
-                  Mount the panels on the wall each one faces, starting with the loudest.
+                  Place the absorption on the wall each one faces, starting with the loudest.
                 </p>
                 {alloc && (
                   <ul className="rg-where">
@@ -1777,8 +1899,8 @@ function RecommendationGuide({ model, counts }) {
             <div className="rg-step-title">Leave the quiet spots bare</div>
             <p>
               {counts.dead} spot{counts.dead > 1 ? "s are" : " is"} already too quiet — shown in blue in the twin.
-              Panels there would make it worse. If they bother you, move the speaker or add something that scatters
-              sound, like a bookshelf, instead.
+              Absorption there would make it worse. If they matter, move the sound source or add a surface that
+              scatters sound (diffusion) instead.
             </p>
           </div>
         </div>
@@ -1838,6 +1960,7 @@ function Recommendations({ model, hasModel, counts }) {
                   </div>
                 );
               })}
+              <ThicknessBasis />
             </div>
           </details>
         </>
