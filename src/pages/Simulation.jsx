@@ -50,31 +50,158 @@ function makeLabel(text, { fg = "#e9eaf0", worldH = 0.34, accent = null } = {}) 
 }
 
 
-/* Soft radial falloff used as the spot glow. One canvas, reused by every
-   marker and tinted per-spot through the sprite material's colour. White so
-   the tint is exact; additive blending makes it read as light, not paint. */
-let _glowTex = null;
-function glowTexture() {
-  if (_glowTex) return _glowTex;
-  const S = 128, c = S / 2;
-  const cv = document.createElement("canvas"); cv.width = cv.height = S;
+/* ------------------------------------------------------------------ *
+ * Sound heatmap
+ * ------------------------------------------------------------------
+ * Replaces the per-reading spheres. Each classified reading carries a
+ * RT60 in seconds (see heatRt) and the field between readings is
+ * a Gaussian-kernel weighted average of the nearby scores (Nadaraya-
+ * Watson kernel smoothing), a standard way to turn scattered point
+ * measurements into a continuous map. Sigma follows the reading spacing.
+ *
+ *   - Cartesian readings (X/Y): distance is metres on the floor.
+ *   - Bearing-only readings: a bearing is a DIRECTION, not a position,
+ *     so the field is interpolated by angle around the room centre (a
+ *     polar projection). Every point on the floor/walls takes the value
+ *     of the directions near it, and the colour fades out toward the
+ *     centre, where all directions meet and nothing was measured.
+ *
+ * Confidence: colour only appears where a reading is actually near
+ * (Gaussian falloff, sigma tied to the reading spacing). Areas far
+ * from every measurement stay clear instead of showing invented values.
+ * ------------------------------------------------------------------ */
+/* Colour follows the measured RT60 on one continuous scale, not the label.
+   Each reading contributes its RT60 in seconds; the field between readings
+   is the kernel-weighted average of those seconds, and every pixel is then
+   coloured from HEAT_STOPS:
+       < 0.2 s          blue    deadspot (deeper blue the lower it goes)
+       0.2 – 0.4 s      green   target band (RT60_TARGET)
+       0.4 – 0.6 s      orange
+       0.6 – 0.8 s      yellow
+       >= 0.8 s         red
+   Neighbouring stops blend, so the map reads as a gradient rather than
+   hard bands. A reading with no RT60 value falls back to a representative
+   value for its label so it still shows in the right colour family. */
+const RT60_LO = RT60_TARGET.low, RT60_HI = RT60_TARGET.high; // classifier thresholds (s)
+const HEAT_FALLBACK_RT = { hot: 0.6, dead: 0.1, neutral: 0.3 };
+const HEAT_STOPS = [
+  [0.05, "#2446c8"], // deep blue — strong deadspot
+  [0.17, "#5b9dff"], // blue — deadspot
+  [0.23, "#34d17a"], // green — target band starts
+  [0.37, "#34d17a"], // green — target band ends
+  [0.45, "#ff9a3c"], // orange
+  [0.62, "#ffd84a"], // yellow
+  [0.80, "#ff4b4b"], // red — full-strength hotspot
+];
+const HEAT_STOPS_RGB = HEAT_STOPS.map(([t, hx]) => [t, hexToRgb(hx.slice(1))]);
+function heatRt(s) {
+  const rt = s.value != null && Number.isFinite(Number(s.value)) ? Number(s.value) : null;
+  return rt != null ? rt : (HEAT_FALLBACK_RT[s.type] ?? HEAT_FALLBACK_RT.neutral);
+}
+function rtToRgb(rt) {
+  const S = HEAT_STOPS_RGB;
+  if (!(rt > S[0][0])) return S[0][1];
+  for (let i = 1; i < S.length; i++) {
+    if (rt <= S[i][0]) {
+      const [t0, c0] = S[i - 1], [t1, c1] = S[i];
+      const k = (rt - t0) / (t1 - t0);
+      return [0, 1, 2].map((c) => c0[c] + (c1[c] - c0[c]) * k);
+    }
+  }
+  return S[S.length - 1][1];
+}
+const rtToCss = (rt) => `rgb(${rtToRgb(rt).map(Math.round).join(",")})`;
+// CSS gradient built from the same stops as the map, for a bar whose left
+// edge is `min` seconds and right edge `max` seconds (legend, echo gauge).
+const heatGradient = (min, max) => `linear-gradient(90deg, ${HEAT_STOPS.map(([t, hx]) =>
+  `${hx} ${(((t - min) / (max - min)) * 100).toFixed(1)}%`).join(", ")})`;
+const HEAT_LEGEND_BG = heatGradient(0.05, 0.9);
+const angDiff = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+const smoothstep = (e0, e1, x) => { const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); };
+
+function makeHeatField(spots, { bearings, w, l }) {
+  if (!spots.length) return () => ({ v: 0, conf: 0 });
+
+  if (bearings) {
+    const pts = spots.map((s) => ({ a: Math.atan2(s.z, s.x), v: heatRt(s) }));
+    let near = Infinity;
+    for (let i = 0; i < pts.length; i++)
+      for (let j = i + 1; j < pts.length; j++) {
+        const d = angDiff(pts[i].a, pts[j].a);
+        if (d > 1e-4 && d < near) near = d;
+      }
+    const sig = Math.max((5 * Math.PI) / 180, Number.isFinite(near) ? near * 0.6 : Math.PI / 6);
+    // Radial fade is measured against the wall in that direction, so a short
+    // wall close to the sensor gets the same full colour as a far one.
+    const toWall = (a) => {
+      const c = Math.abs(Math.cos(a)), sn = Math.abs(Math.sin(a));
+      return Math.min(c > 1e-6 ? w / 2 / c : Infinity, sn > 1e-6 ? l / 2 / sn : Infinity) || 1;
+    };
+    return (x, z) => {
+      const a = Math.atan2(z, x);
+      let num = 0, den = 0, conf = 0;
+      for (const p of pts) {
+        const d = angDiff(a, p.a);
+        const g = Math.exp(-(d * d) / (2 * sig * sig));
+        num += (g + 1e-9) * p.v; den += g + 1e-9;
+        if (g > conf) conf = g;
+      }
+      return { v: den ? num / den : 0, conf: conf * smoothstep(0.1, 0.6, Math.hypot(x, z) / toWall(a)) };
+    };
+  }
+
+  const pts = spots.map((s) => ({ x: s.x, z: s.z, v: heatRt(s) }));
+  let near = Infinity;
+  for (let i = 0; i < pts.length; i++)
+    for (let j = i + 1; j < pts.length; j++) {
+      const d = Math.hypot(pts[i].x - pts[j].x, pts[i].z - pts[j].z);
+      if (d > 1e-4 && d < near) near = d;
+    }
+  const minFoot = Math.max(0.05, Math.min(w, l));
+  const sig = Math.max(0.18 * minFoot, Number.isFinite(near) ? near * 0.8 : 0.35 * minFoot);
+  return (x, z) => {
+    let num = 0, den = 0, conf = 0;
+    for (const p of pts) {
+      const d2 = (x - p.x) ** 2 + (z - p.z) ** 2;
+      const g = Math.exp(-d2 / (2 * sig * sig));
+      num += (g + 1e-9) * p.v; den += g + 1e-9;
+      if (g > conf) conf = g;
+    }
+    return { v: den ? num / den : 0, conf };
+  };
+}
+
+/* Pixel colour comes straight from the RT60 ramp; opacity only tracks
+   confidence (how close a real reading is), so every band — including the
+   green target band — is equally visible. */
+const HEAT_ALPHA = 0.82;
+function heatPixel(v, conf, out, o) {
+  const [r, g, b] = rtToRgb(v);
+  out[o] = r; out[o + 1] = g; out[o + 2] = b;
+  out[o + 3] = 255 * conf * HEAT_ALPHA;
+}
+
+/* Paint a W x H texture; `at(i, j)` returns the field sample for a pixel. */
+function heatTexture(W, H, at) {
+  const cv = document.createElement("canvas"); cv.width = W; cv.height = H;
   const ctx = cv.getContext("2d");
-  const g = ctx.createRadialGradient(c, c, 0, c, c, c);
-  g.addColorStop(0.00, "rgba(255,255,255,0.50)");
-  g.addColorStop(0.18, "rgba(255,255,255,0.28)");
-  g.addColorStop(0.45, "rgba(255,255,255,0.11)");
-  g.addColorStop(0.72, "rgba(255,255,255,0.035)");
-  g.addColorStop(1.00, "rgba(255,255,255,0)");
-  ctx.fillStyle = g; ctx.fillRect(0, 0, S, S);
-  _glowTex = new THREE.CanvasTexture(cv);
-  _glowTex.minFilter = THREE.LinearFilter;
-  return _glowTex;
+  const img = ctx.createImageData(W, H);
+  for (let j = 0; j < H; j++)
+    for (let i = 0; i < W; i++) {
+      const { v, conf } = at(i, j);
+      heatPixel(v, conf, img.data, (j * W + i) * 4);
+    }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+  if (THREE.SRGBColorSpace) tex.colorSpace = THREE.SRGBColorSpace; // pixels are sRGB
+  return tex;
 }
 
 // Where the prototype STLs are served from — put both files in your app's
 // /public/models/ folder. `deviceUrl` / `soundDeviceUrl` props override them.
 //   Hardware_1.stl — the default prototype shown in the twin.
-//   Hardware_2.stl — shown instead while the Imbalanced sound layer is on.
+//   Hardware_2.stl — shown instead while the Sound heatmap layer is on.
 const DEVICE_URLS = { hw1: "/models/Hardware_1.stl", hw2: "/models/Hardware_2.stl" };
 const DEVICE_NAMES = { hw1: "Hardware 1", hw2: "Hardware 2" };
 // Each model is drawn at a real, fixed size in metres — the same units as the
@@ -187,6 +314,11 @@ const RX_X = /^\s*(x|x_m|x_mm|x_pos|pos_x|coord_x|x_coord)\s*$/i;
 const RX_Y = /^\s*(y|y_m|y_mm|y_pos|pos_y|coord_y|y_coord)\s*$/i;
 const RX_CLASS = /class|label|zone|category|status|spot/i;
 const RX_METRIC = /rt60|reverb|spl|level|db|energy|score|intensity/i;
+/* The decay-time column is preferred over any other level column: a tab can
+   carry both "RT60" and e.g. "Peak_dB", and the first loose match used to win,
+   so the heatmap could be reading dB instead of seconds. */
+const RX_RT60 = /rt60|t20|t30|edt|decay.?time/i;
+const metricCol = (cols) => { const i = colIdx(cols, RX_RT60); return i >= 0 ? i : colIdx(cols, RX_METRIC); };
 const RX_ANGLE = /^\s*(angle|bearing|azimuth|heading|deg)/i;
 
 /* Classification is the tab that owns hot/dead/neutral, so it is searched
@@ -202,7 +334,7 @@ function rankedTabs(tabs) {
     .map((e) => ({
       ...e,
       classI: colIdx(e.cols, RX_CLASS),
-      metricI: colIdx(e.cols, RX_METRIC),
+      metricI: metricCol(e.cols),
       angleI: colIdx(e.cols, RX_ANGLE),
       xi: colIdx(e.cols, RX_X),
       yi: colIdx(e.cols, RX_Y),
@@ -355,7 +487,7 @@ function parseDeployment(dep) {
     if (bands.length) break;
   }
 
-  return { room, rawPoints, spots, spotsFrom, rt60, bands, roomTs: dep.roomTs, at: dep.at };
+  return { room, rawPoints, spots, spotsAreBearings, spotsFrom, rt60, bands, roomTs: dep.roomTs, at: dep.at };
 }
 
 /* ================================================================== *
@@ -425,7 +557,7 @@ function auditDeployment(dep, model) {
     const ci = colIdx(cls.cols, RX_CLASS);
     const ai = colIdx(cls.cols, RX_ANGLE);
     const xi = colIdx(cls.cols, RX_X), yi = colIdx(cls.cols, RX_Y);
-    const mi = colIdx(cls.cols, RX_METRIC);
+    const mi = metricCol(cls.cols);
 
     if (ci < 0) errors.push({ title: `Missing parameter — classification column in “${cls.name}”`, body: "No column names which readings are hotspots, neutral zones or deadspots. Spots are only drawn from labels read off the sheet, so the imbalance layer stays empty." });
     if (ai < 0 && (xi < 0 || yi < 0)) {
@@ -521,8 +653,14 @@ async function loadDevice(url) {
   }
 }
 
-export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = false } = {}) {
-  const [dep, setDep] = useState(() => vibraHistory.getDeployment());
+/* `scan` (optional): a saved History entry to draw instead of the current
+   deployment. It has the same shape the Parameters table deploys —
+   { roomTs, dims, tabs } — so it goes through the same parser and audit.
+   Passing it never touches the deployment, so the Simulation page and the
+   rest of the app keep showing the deployed scan. */
+export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = false, scan = null } = {}) {
+  const [deployed, setDep] = useState(() => vibraHistory.getDeployment());
+  const dep = scan ?? deployed;
   const [orbiting, setOrbiting] = useState(true);
   // Default view: only the room shell and its raw points; everything else is opt-in.
   // The Dashboard's Room twin (twinOnly) has no layers panel, so it always shows
@@ -531,7 +669,7 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
   const [hover, setHover] = useState(null);
   const hrefs = { hw1: deviceUrl || DEVICE_URLS.hw1, hw2: soundDeviceUrl || DEVICE_URLS.hw2 };
   const [devices, setDevices] = useState({ hw1: { geo: null, status: "loading" }, hw2: { geo: null, status: "loading" } });
-  // Which prototype the twin shows: Hardware 2 while Imbalanced sound is on
+  // Which prototype the twin shows: Hardware 2 while Sound heatmap is on
   // (and its file loaded), otherwise Hardware 1.
   const activeDevice = layers.spots && devices.hw2.geo ? "hw2" : "hw1";
   const active = devices[activeDevice];
@@ -826,64 +964,97 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
       content.add(pts); groups.raw = pts;
     }
 
-    // hot / dead spots
+    // sound heatmap (replaces the per-reading spheres) — see makeHeatField
     const pick = [];
     if (model.spots.length) {
-      const spotGroup = new THREE.Group();
-      const y = Math.min(1.2, h * 0.5);
+      const heat = new THREE.Group();
+      const field = makeHeatField(model.spots, { bearings: !!model.spotsAreBearings, w, l });
+      // What the heatmap is actually painting, per reading — check here first
+      // if every patch looks the same strength (e.g. RT60 column not found).
+      console.info("[VIBRA] heatmap readings", model.spots.map((sp) => ({
+        label: sp.type, rt60_s: sp.value, bearing: sp.angle, rt60_used: +heatRt(sp).toFixed(3), colour: rtToCss(heatRt(sp)),
+      })));
+      if (model.spots.every((sp) => sp.value == null))
+        console.warn("[VIBRA] heatmap: no RT60 values found in the classification tab — every reading uses its label's fallback RT60 (hot 0.6 s / neutral 0.3 s / dead 0.1 s).");
+      const heatMat = (tex) => new THREE.MeshBasicMaterial({
+        map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide,
+      });
 
-      // Marker size follows the room's physical scale instead of a fixed 0.15 m.
-      // Base: 7 % of the smallest room dimension (≈0.21 m in a 3 m room).
-      // Cap: 45 % of the tightest spacing between spots, so neighbouring
-      // readings stay distinct instead of merging into one blob.
-      const minDim = Math.max(0.05, Math.min(w, l, h));
-      let nearest = Infinity;
-      for (let i = 0; i < model.spots.length; i++) {
-        for (let j = i + 1; j < model.spots.length; j++) {
-          const d = Math.hypot(model.spots[i].x - model.spots[j].x, model.spots[i].z - model.spots[j].z);
-          if (d > 1e-4 && d < nearest) nearest = d;
-        }
+      // Floor: the field over the whole footprint.
+      {
+        const RES = 220;
+        const W = Math.max(8, Math.round(RES * (w / Math.max(w, l))));
+        const H = Math.max(8, Math.round(RES * (l / Math.max(w, l))));
+        const sample = (i, j) => field(-w / 2 + ((i + 0.5) / W) * w, -l / 2 + ((j + 0.5) / H) * l);
+        const tex = heatTexture(W, H, sample);
+        const plane = new THREE.Mesh(new THREE.PlaneGeometry(w, l), heatMat(tex));
+        plane.rotation.x = -Math.PI / 2; plane.position.y = 0.012; plane.renderOrder = 4;
+        heat.add(plane);
+
+        // Ceiling: the same footprint field. The mic is omnidirectional, so a
+        // reading covers the ceiling as much as the floor. Drawn a little
+        // lighter so a top-down view (looking through the ceiling onto the
+        // floor) doesn't stack into a darker colour than either surface has.
+        const ceilTex = heatTexture(W, H, (i, j) => { const f = sample(i, j); return { v: f.v, conf: f.conf * 0.6 }; });
+        const ceil = new THREE.Mesh(new THREE.PlaneGeometry(w, l), heatMat(ceilTex));
+        ceil.rotation.x = -Math.PI / 2; ceil.position.y = h - 0.012; ceil.renderOrder = 4;
+        heat.add(ceil);
       }
-      const coreR = Math.max(0.004, Math.min(minDim * 0.07, Number.isFinite(nearest) ? nearest * 0.45 : Infinity));
-      const glowS = coreR * 6.3;   // keeps the old 0.15 : 0.95 core-to-glow ratio
-      const hitR = coreR * 2.3;    // keeps the old 0.15 : 0.34 pick-target ratio
+
+      // Walls: the same field along each wall, floor to ceiling at even
+      // strength. The mic is omnidirectional and each reading is one RT60 for
+      // the whole direction, so it carries no height information: fading the
+      // colour toward the floor or ceiling would invent a vertical variation
+      // that was never measured. yM is only where the reading ticks sit.
+      const yM = Math.min(1.2, h * 0.5);
+      const inset = Math.min(w, l) * 0.004;
+      const walls = [
+        { len: w, ry: 0, pos: [0, -l / 2 + inset], at: (u) => [-w / 2 + u * w, -l / 2] },           // north
+        { len: w, ry: Math.PI, pos: [0, l / 2 - inset], at: (u) => [w / 2 - u * w, l / 2] },         // south
+        { len: l, ry: -Math.PI / 2, pos: [w / 2 - inset, 0], at: (u) => [w / 2, -l / 2 + u * l] },   // east
+        { len: l, ry: Math.PI / 2, pos: [-w / 2 + inset, 0], at: (u) => [-w / 2, l / 2 - u * l] },   // west
+      ];
+      walls.forEach((wl) => {
+        const W = Math.max(8, Math.round(200 * (wl.len / Math.max(w, l))));
+        const H = Math.max(8, Math.round(W * (h / wl.len)));
+        const tex = heatTexture(Math.min(W, 256), Math.min(H, 256), (i, j) => {
+          const u = (i + 0.5) / Math.min(W, 256);
+          const [x, z] = wl.at(u);
+          const f = field(x, z);
+          return { v: f.v, conf: f.conf * 0.85 };
+        });
+        const plane = new THREE.Mesh(new THREE.PlaneGeometry(wl.len, h), heatMat(tex));
+        plane.rotation.y = wl.ry; plane.position.set(wl.pos[0], h / 2, wl.pos[1]); plane.renderOrder = 4;
+        heat.add(plane);
+      });
+
+      // Where each reading was taken: a small flat cross (not a marker the
+      // eye reads as a sound source), plus an invisible hover target.
+      const minDim = Math.max(0.05, Math.min(w, l, h));
+      const tickR = minDim * 0.035;
+      const hitR = minDim * 0.08;
+      const crossMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55, depthWrite: false });
       model.spots.forEach((s) => {
-        const col = s.type === "hot" ? COL.hot : s.type === "neutral" ? COL.neutral : COL.dead;
         const info = { type: s.type, value: s.value, x: s.x, z: s.z, angle: s.angle };
-        // Solid, slightly deepened body so the marker reads as an object with a
-        // colour rather than a blown-out light source. The glow is carried by
-        // the sprite behind it, not by over-driving the surface.
-        const solid = new THREE.Color(col).multiplyScalar(0.82);
-        const core = new THREE.Mesh(
-          new THREE.SphereGeometry(coreR, 24, 18),
-          new THREE.MeshStandardMaterial({
-            color: solid, emissive: solid, emissiveIntensity: 0.16,
-            roughness: 0.55, metalness: 0.0,
-          })
+        const y = model.spotsAreBearings ? yM : 0.02;
+        const cross = new THREE.LineSegments(
+          new THREE.BufferGeometry().setFromPoints(model.spotsAreBearings
+            ? [new THREE.Vector3(s.x, y - tickR, s.z), new THREE.Vector3(s.x, y + tickR, s.z)]
+            : [new THREE.Vector3(s.x - tickR, y, s.z), new THREE.Vector3(s.x + tickR, y, s.z),
+               new THREE.Vector3(s.x, y, s.z - tickR), new THREE.Vector3(s.x, y, s.z + tickR)]),
+          crossMat
         );
-        core.position.set(s.x, y, s.z); core.userData = info;
-
-        // Billboarded glow. Additive so overlapping markers bloom together
-        // instead of stacking into flat opaque discs.
-        const glow = new THREE.Sprite(new THREE.SpriteMaterial({
-          map: glowTexture(), color: col, transparent: true,
-          blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.9,
-        }));
-        glow.position.copy(core.position);
-        glow.scale.set(glowS, glowS, 1);
-        glow.renderOrder = 5;
-
-        // Invisible but pickable, so hover keeps the old generous target size.
+        cross.renderOrder = 6;
         const hit = new THREE.Mesh(
           new THREE.SphereGeometry(hitR, 12, 10),
           new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false })
         );
-        hit.position.copy(core.position); hit.userData = info;
-
-        spotGroup.add(glow, core, hit);
-        pick.push(core, hit);
+        hit.position.set(s.x, y, s.z); hit.userData = info;
+        heat.add(cross, hit);
+        pick.push(hit);
       });
-      content.add(spotGroup); groups.spots = spotGroup;
+
+      content.add(heat); groups.spots = heat;
     }
     spotsRef.current = pick;
 
@@ -1040,7 +1211,13 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
             <div className="sim-empty">
               <AlertCircle size={26} color="var(--bad)" />
               <div className="big">Missing parameter.</div>
-              <div className="small">{audit.errors[0]?.body || "The deployed scan is incomplete."}</div>
+              <div className="small">{audit.errors[0]?.body || (scan ? "The saved scan is incomplete." : "The deployed scan is incomplete.")}</div>
+            </div>
+          ) : scan ? (
+            <div className="sim-empty">
+              <Radio size={26} color="var(--faint)" />
+              <div className="big">No room geometry in this saved scan.</div>
+              <div className="small">It was saved without room dimensions, so there is no twin to draw.</div>
             </div>
           ) : (
             <div className="sim-empty">
@@ -1057,8 +1234,8 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
         )}
         {hover && (
           <div className="sim-tip" style={{ left: hover.sx + 14, top: hover.sy + 14 }}>
-            <div className={`hd ${hover.type === "hot" ? "hot" : "dead"}`} style={hover.type === "neutral" ? { color: "var(--sim-neutral)" } : undefined}>
-              <span className={`sd ${hover.type === "hot" ? "hot" : "dead"}`} style={hover.type === "neutral" ? { background: "var(--sim-neutral)" } : undefined} />
+            <div className={`hd ${hover.type === "hot" ? "hot" : "dead"}`} style={{ color: rtToCss(heatRt(hover)) }}>
+              <span className={`sd ${hover.type === "hot" ? "hot" : "dead"}`} style={{ background: rtToCss(heatRt(hover)) }} />
               {SPOT_LABEL[hover.type] || "Spot"}
             </div>
             {hover.value != null && numish(hover.value) && <div className="ln">RT60 {Number(hover.value).toLocaleString(undefined, { maximumFractionDigits: 3 })} s</div>}
@@ -1114,9 +1291,9 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
           <div className="sim-boxhead">
             <div className="h"><div className="t">Live scan</div><div className="s">Combined twin</div></div>
             <div className="sim-legend">
-              <span className="hstack"><span className="sd hot" /> Hotspot</span>
-              <span className="hstack"><span className="sd dead" /> Deadspot</span>
-              <span className="hstack"><span className="sd" style={{ background: "var(--sim-neutral)" }} /> Neutral</span>
+              <span className="heat-legend" aria-label="Heatmap scale: RT60 below 0.2 s blue (deadspot), 0.2 to 0.4 s green (target), 0.4 to 0.6 s orange, 0.6 to 0.8 s yellow, 0.8 s and above red">
+                <span>&lt;0.2 s</span><span className="heat-bar" style={{ background: HEAT_LEGEND_BG }} /><span>0.8+ s</span>
+              </span>
             </div>
             <button className={`btn${orbiting ? "" : " btn--primary"}`} onClick={() => setOrbiting((v) => !v)}>
               {orbiting ? <><Pause size={15} color="var(--ink)" /> Pause</> : <><Play size={15} color="#17131f" /> Start</>}
@@ -1149,7 +1326,7 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
             <LayerRow tone="shell" label="Room shell (fit)" on={layers.shell} onClick={() => toggle("shell")} disabled={!hasModel} />
             <LayerRow tone="edge" label="Detected edges" on={layers.edges} onClick={() => toggle("edges")} disabled={!hasModel} />
             <LayerRow tone="raw" label={`Raw points${model?.rawPoints?.length ? ` (${model.rawPoints.length})` : ""}`} on={layers.raw} onClick={() => toggle("raw")} disabled={!hasModel || !model?.rawPoints?.length} />
-            <LayerRow tone="hot" label={`Imbalanced sound${model?.spots?.length ? ` (${counts.hot} hot / ${counts.dead} dead / ${counts.neutral} neutral)` : ""}`} on={layers.spots} onClick={() => toggle("spots")} disabled={!hasModel || !model?.spots?.length} />
+            <LayerRow tone="heat" label={`Sound heatmap${model?.spots?.length ? ` (${counts.hot} hot / ${counts.dead} dead / ${counts.neutral} neutral)` : ""}`} on={layers.spots} onClick={() => toggle("spots")} disabled={!hasModel || !model?.spots?.length} />
             <LayerRow tone="device"
               label={active.status === "error" ? `Prototype — ${DEVICE_NAMES[activeDevice]} not found` : active.status === "loading" ? "Prototype — loading…" : `Prototype (${DEVICE_NAMES[activeDevice]})`}
               on={layers.device} onClick={() => toggle("device")} disabled={!hasModel || !active.geo} />
@@ -1164,9 +1341,13 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
             }}
           >
             <div style={{ margin: 0 }}>
-              Red marks hotspots, blue deadspots, cyan neutral zones — hover a point for details.
-              Bearing-only scans are projected onto the wall each reading faced, so a marker shows
-              the direction measured, not a localised sound source.
+              Colour follows the measured RT60: blue is a deadspot (below 0.2 s), green is the
+              0.2–0.4 s target band, then orange (0.4–0.6 s), yellow (0.6–0.8 s) and red (0.8 s and
+              above). Colour between readings is a kernel-weighted average of the nearby RT60 values and fades out
+              where no reading is close. Bearing-only scans are interpolated by direction around
+              the sensor, so colour shows where each reading faced, not a localised sound source.
+              The mic is omnidirectional, so colour runs floor to ceiling at even strength — the
+              readings carry no height information. Small ticks mark the readings — hover one for details.
             </div>
             {/* The empty-spot case is reported by the parameter panel above the
                 boxes, where it can name the column that is actually missing —
@@ -1183,7 +1364,7 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
                 }}
               >
                 {DEVICE_NAMES[k]} not found at “{hrefs[k]}”.
-                {k === "hw2" ? " Hardware 1 is shown with Imbalanced sound instead." : ""}
+                {k === "hw2" ? " Hardware 1 is shown with Sound heatmap instead." : ""}
               </div>
             ))}
           </div>
@@ -1688,7 +1869,7 @@ function EchoGauge({ rt }) {
   return (
     <div className="rg-gauge" role="img"
       aria-label={`Echo time ${rt.toFixed(2)} seconds; goal ${RT60_TARGET.low} to ${RT60_TARGET.high} seconds`}>
-      <div className="rg-gauge-track">
+      <div className="rg-gauge-track" style={{ background: heatGradient(0, max) }}>
         <span className="rg-gauge-goal" style={{ "--from": pct(RT60_TARGET.low), "--to": pct(RT60_TARGET.high) }} />
         <span className="rg-gauge-you" style={{ "--at": pct(rt) }}>
           <span className="rg-gauge-tag">Your room {rt.toFixed(1)} s</span>
@@ -2032,7 +2213,7 @@ function applyLayers(groups, layers) {
   if (groups.raw) groups.raw.visible = layers.raw;
   if (groups.spots) groups.spots.visible = layers.spots;
   if (groups.omni) groups.omni.visible = layers.omni;
-  // One prototype at a time: Hardware 2 while Imbalanced sound is on (if it
+  // One prototype at a time: Hardware 2 while Sound heatmap is on (if it
   // loaded), Hardware 1 otherwise.
   const sound = layers.spots && !!groups.device2;
   if (groups.device1) groups.device1.visible = layers.device && !sound;

@@ -1,5 +1,16 @@
 import React, { useMemo, useState, useEffect } from "react";
-import { Download, Ruler, Box, Volume2, Flame, VolumeX, Timer } from "lucide-react";
+import {
+  Download,
+  Ruler,
+  Box,
+  Volume2,
+  Flame,
+  VolumeX,
+  Timer,
+  History,
+  ChevronDown,
+  Check,
+} from "lucide-react";
 
 import { CONFIG, fmt } from "../config.js";
 import { useRoomData } from "../data/useRoomData.jsx";
@@ -16,12 +27,13 @@ import {
 /* -------------------------------------------------------
    Helpers
    Every value shown on this page comes from the fetched
-   sheet data. Nothing falls back to a sample or a default:
-   a missing value is shown as "—" so it is never mistaken
-   for a real reading.
+   sheet data or a saved scan. Nothing falls back to a
+   sample or a default: a missing value is shown as "—"
+   so it is never mistaken for a real reading.
 ------------------------------------------------------- */
 
 const MISSING = "—";
+const LIVE = "live"; // filter value for the currently deployed scan
 
 const has = (v) =>
   v !== null &&
@@ -32,7 +44,7 @@ const has = (v) =>
 const whenText = (ts) => {
   if (!ts) return null;
 
-  const d = new Date(String(ts).replace(" ", "T"));
+  const d = new Date(typeof ts === "number" ? ts : String(ts).replace(" ", "T"));
   return Number.isNaN(d.getTime())
     ? String(ts)
     : d.toLocaleString();
@@ -105,6 +117,51 @@ const readDeployment = () => {
   }
 };
 
+/* Guarded read of the saved scans (History page list). */
+const readSaved = () => {
+  try {
+    const l = typeof vibraHistory?.list === "function" ? vibraHistory.list() : [];
+    return Array.isArray(l) ? l.filter((e) => e && e.id) : [];
+  } catch (err) {
+    console.error("Dashboard: could not read saved scans", err);
+    return [];
+  }
+};
+
+
+/* -------------------------------------------------------
+   Saved-scan readers
+   A saved entry is what ParametersTable.saveView() stores:
+     { id, label, roomTs, dims, tabs, savedAt }
+   the same shape as a deployment, plus id / label / savedAt.
+------------------------------------------------------- */
+
+const entryTabs = (e) => (e && e.tabs && typeof e.tabs === "object" ? e.tabs : null);
+
+function entryRoom(e) {
+  const d = e?.dims || {};
+  const out = {};
+  ["width", "length", "height"].forEach((k) => { if (has(d[k])) out[k] = Number(d[k]); });
+  return out;
+}
+
+const entryTs = (e) => e?.roomTs || e?.savedAt || null;
+
+const dimsText = (room) =>
+  ["width", "length", "height"].every((k) => has(room[k]))
+    ? `${fmt(room.width)} × ${fmt(room.length)} × ${fmt(room.height)} m`
+    : null;
+
+/* Label shown in the filter for a saved scan. */
+function entryLabel(e, index) {
+  const saved = e?.savedAt ? `Saved ${whenText(e.savedAt)}` : null;
+  return {
+    title: e?.label || e?.roomTs || `Room scan ${index + 1}`,
+    sub: [dimsText(entryRoom(e)), saved].filter(Boolean).join(" · ") || "No details recorded",
+  };
+}
+
+
 /* -------------------------------------------------------
    Dashboard
    Panels: Room twin · Acoustic scan · Spatial status
@@ -122,71 +179,76 @@ export default function Dashboard() {
     return vibraHistory.onDeploy((payload) => setDep(payload ?? null));
   }, []);
 
-  /* Acoustic scan: a summary of the deployed Classification tab. The scan
-     time comes from the Reverberation tab, same as on the Parameters Table. */
+  /* Saved scans for the room filter, followed live from the History store. */
+  const [saved, setSaved] = useState(readSaved);
+  useEffect(() => {
+    if (typeof vibraHistory?.subscribe !== "function") return undefined;
+    const off = vibraHistory.subscribe(() => setSaved(readSaved()));
+    return () => { off(); };
+  }, []);
+
+  /* Which room the page shows: the deployed scan, or a saved one by id. */
+  const [roomPick, setRoomPick] = useState(LIVE);
+  const entry = roomPick === LIVE ? null : saved.find((e) => e.id === roomPick) ?? null;
+
+  /* A saved scan deleted from History drops the filter back to the current scan. */
+  useEffect(() => {
+    if (roomPick !== LIVE && !saved.some((e) => e.id === roomPick)) setRoomPick(LIVE);
+  }, [saved, roomPick]);
+
+  /* Acoustic scan: a summary of the Classification tab. The scan time comes
+     from the Reverberation tab, same as on the Parameters Table. */
   const acoustic = useMemo(() => {
-    const tabs = dep?.tabs ?? null;
+    const tabs = entry ? entryTabs(entry) : dep?.tabs ?? null;
     const cls = findTab(tabs, /class/i);
     const rev = findTab(tabs, /reverb/i);
     return {
       summary: summarize(cls),
       when: acousticTs(rev),
     };
-  }, [dep]);
+  }, [dep, entry]);
 
-  const classRows = acoustic.summary.positions;
+  const savedRoom = useMemo(() => (entry ? entryRoom(entry) : null), [entry]);
 
-  /* Nothing deployed yet — the page stays blank. */
-  if (!dep) return <BlankDashboard />;
+  const filter = (
+    <RoomFilter saved={saved} value={roomPick} onChange={setRoomPick} />
+  );
 
-  /* Loading */
-  if (data.loading) {
-    return (
-      <div className="page">
-        <p className="panel-sub">
-          Fetching scan from the sheet…
-        </p>
-      </div>
-    );
-  }
+  /* -----------------------------------------------------
+     Default ("blank") state: the full layout is always drawn —
+     twin, Acoustic scan and Spatial status boxes — and every
+     value reads "—" until a scan with values is deployed or a
+     saved scan is picked. Loading and errors only change the
+     header line; the boxes stay in place.
+  ----------------------------------------------------- */
+  const live = !entry;
+  const loading = live && !!dep && data.loading;
+  const error = live && !!dep && !data.loading ? data.error : null;
 
-  /* Error */
-  if (data.error) {
-    return (
-      <div className="page">
-        <div className="card">
-          <h3 className="panel-title">
-            Could not load scan
-          </h3>
+  const rawRoom = entry ? savedRoom : (dep && !loading && !error ? data.room ?? {} : {});
+  const hasRoom = ["width", "length", "height", "area", "volume"].some((k) => has(rawRoom?.[k]));
+  const hasAcoustic = acoustic.summary.positions > 0 && !loading && !error;
+  const blank = (!dep && !entry) || (!hasRoom && !hasAcoustic);
 
-          <p className="panel-sub">
-            {data.error}
-          </p>
-        </div>
-      </div>
-    );
-  }
+  const room = blank ? {} : rawRoom;
+  const summary = blank ? summarize(null) : acoustic.summary;
+  const acousticWhen = blank ? null : acoustic.when;
+  const scan = blank || entry ? {} : data.scan ?? {};
+  const roomTs = blank ? null : entry ? entryTs(entry) : data.roomTs;
+  const when = whenText(roomTs);
 
-  const room = data.room ?? {};
-  const scan = data.scan ?? {};
-  const when = whenText(data.roomTs);
-
-
-  const hasRoom = ["width", "length", "height", "area", "volume"]
-    .some((k) => has(room[k]));
-
-  /* Deployed, but none of its values came through — still blank. */
-  if (!hasRoom && !classRows) return <BlankDashboard />;
-
-  /* Header meta — only what was actually fetched */
-  const meta = [
-    when ? `Last scan ${when}` : "Scan time not recorded",
-    has(scan.points)
-      ? `${Number(scan.points).toLocaleString()} points`
-      : null,
-    scan.device || null,
-  ].filter(Boolean);
-
+  /* Header line — the status when blank, otherwise what was fetched. */
+  const meta = loading
+    ? ["Fetching scan from the sheet…"]
+    : error
+      ? [`Could not load scan — ${error}`]
+      : blank
+        ? [entry ? "This saved scan has no room or acoustic values" : "No room scan deployed yet"]
+        : [
+            when ? `${entry ? "Saved scan" : "Last scan"} ${when}` : "Scan time not recorded",
+            has(scan.points) ? `${Number(scan.points).toLocaleString()} points` : null,
+            scan.device || null,
+          ].filter(Boolean);
 
   return (
     <div className="page">
@@ -204,13 +266,19 @@ export default function Dashboard() {
           </p>
         </div>
 
-        <button
-          className="export"
-          onClick={() => exportDashboardPdf(data)}
-        >
-          <Download size={17} />
-          Export report
-        </button>
+        <div className="pagehead-actions">
+          {filter}
+
+          <button
+            className="export"
+            disabled={blank}
+            title={blank ? "Deploy or pick a scan to export a report" : undefined}
+            onClick={() => exportDashboardPdf(entry ? { ...data, room, roomTs } : data)}
+          >
+            <Download size={17} />
+            Export report
+          </button>
+        </div>
       </div>
 
 
@@ -232,7 +300,9 @@ export default function Dashboard() {
             </h3>
 
             <p className="panel-sub">
-              Live scan from the Simulation
+              {entry
+                ? `Saved scan ${entry.label || entry.roomTs || ""}`.trim()
+                : dep ? "Live scan from the Simulation" : "No scan deployed"}
               {has(room.height) && ` · ${fmt(Number(room.height))} m ceiling`}
             </p>
 
@@ -240,7 +310,7 @@ export default function Dashboard() {
 
 
           <div className="twin-canvas">
-            <SimulationPage twinOnly />
+            <SimulationPage twinOnly scan={entry} />
           </div>
 
 
@@ -281,27 +351,29 @@ export default function Dashboard() {
             <div className="h">
               <div className="sp-title">Acoustic scan</div>
               <div className="sp-sub">
-                {acoustic.summary.positions
-                  ? `Summary of ${acoustic.summary.positions} classified position${acoustic.summary.positions === 1 ? "" : "s"}`
-                  : "No classification data in the deployed scan"}
+                {summary.positions
+                  ? `Summary of ${summary.positions} classified position${summary.positions === 1 ? "" : "s"}`
+                  : blank
+                    ? "Summary of the classified positions"
+                    : `No classification data in the ${entry ? "saved" : "deployed"} scan`}
               </div>
             </div>
 
-            {acoustic.when && (
-              <span className="sp-when">Acoustic scan · {acoustic.when}</span>
+            {acousticWhen && (
+              <span className="sp-when">Acoustic scan · {acousticWhen}</span>
             )}
           </div>
 
           <div className="sp-grid">
-            <Cell icon={<Flame size={16} color={c.hot} />} label="Hot spots" value={acoustic.summary.hot} />
-            <Cell icon={<VolumeX size={16} color={c.dead} />} label="Dead spots" value={acoustic.summary.dead} />
+            <Cell icon={<Flame size={16} color={c.hot} />} label="Hot spots" value={summary.hot} />
+            <Cell icon={<VolumeX size={16} color={c.dead} />} label="Dead spots" value={summary.dead} />
           </div>
 
           {/* Lowest and highest side by side, average across the full width below */}
           <div className="sp-grid">
-            <Cell icon={<Timer size={16} color="var(--violet)" />} label="Lowest RT60" value={acoustic.summary.min} unit="s" digits={2} />
-            <Cell icon={<Timer size={16} color="var(--violet)" />} label="Highest RT60" value={acoustic.summary.max} unit="s" digits={2} />
-            <Cell icon={<Timer size={16} color="var(--violet)" />} label="Average RT60" value={acoustic.summary.avg} unit="s" digits={2} wide />
+            <Cell icon={<Timer size={16} color="var(--violet)" />} label="Lowest RT60" value={summary.min} unit="s" digits={2} />
+            <Cell icon={<Timer size={16} color="var(--violet)" />} label="Highest RT60" value={summary.max} unit="s" digits={2} />
+            <Cell icon={<Timer size={16} color="var(--violet)" />} label="Average RT60" value={summary.avg} unit="s" digits={2} wide />
           </div>
 
         </section>
@@ -323,8 +395,8 @@ export default function Dashboard() {
             <div className="sp-sub">Room dimensions from the LiDAR scan</div>
           </div>
 
-          {data.roomTs && (
-            <span className="sp-when">Room scan · {data.roomTs}</span>
+          {when && (
+            <span className="sp-when">Room scan · {when}</span>
           )}
         </div>
 
@@ -336,6 +408,100 @@ export default function Dashboard() {
 
       </section>
 
+    </div>
+  );
+}
+
+
+/* -------------------------------------------------------
+   Room filter — pick the deployed scan or a saved one
+------------------------------------------------------- */
+
+function RoomFilter({ saved, value, onChange }) {
+  const [open, setOpen] = useState(false);
+
+  /* Close on Escape. */
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  const index = saved.findIndex((e) => e.id === value);
+  const current = index >= 0 ? entryLabel(saved[index], index) : null;
+
+  const choose = (id) => { onChange(id); setOpen(false); };
+
+  return (
+    <div className="room-filter">
+      <span className="room-filter-lbl" id="room-filter-lbl">Scanned room</span>
+
+      <div className="menu-wrap">
+        <button
+          className="export"
+          onClick={() => setOpen((o) => !o)}
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          aria-labelledby="room-filter-lbl"
+        >
+          <History size={16} />
+          <span className="pick-lbl on w200">{current ? current.title : "Current scan"}</span>
+          <ChevronDown size={15} className={`chev${open ? " open" : ""}`} />
+        </button>
+
+        {open && (
+          <>
+            <div className="menu-overlay" onClick={() => setOpen(false)} />
+
+            <div className="menu right room-menu thin-scroll" role="listbox" aria-labelledby="room-filter-lbl">
+
+              <button
+                className={`menu-item${value === LIVE ? " active" : ""}`}
+                role="option"
+                aria-selected={value === LIVE}
+                onClick={() => choose(LIVE)}
+              >
+                <span className="mi-text">
+                  <span className="mi-title">Current scan</span>
+                  <span className="mi-sub">Deployed from the Parameters table</span>
+                </span>
+                {value === LIVE && <span className="mi-end"><Check size={15} /></span>}
+              </button>
+
+              <div className="menu-sep" />
+
+              {saved.length ? (
+                saved.map((e, i) => {
+                  const l = entryLabel(e, i);
+                  const on = e.id === value;
+                  return (
+                    <button
+                      key={e.id}
+                      className={`menu-item${on ? " active" : ""}`}
+                      role="option"
+                      aria-selected={on}
+                      onClick={() => choose(e.id)}
+                    >
+                      <span className="mi-text">
+                        <span className="mi-title ell">{l.title}</span>
+                        <span className="mi-sub ell">{l.sub}</span>
+                      </span>
+                      <span className="mi-end">
+                        {i === 0 && <span className="menu-latest">Latest</span>}
+                        {on && <Check size={15} />}
+                      </span>
+                    </button>
+                  );
+                })
+              ) : (
+                <div className="menu-note">No saved scans yet. Save one from the Parameters table.</div>
+              )}
+
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -365,31 +531,13 @@ const MoveV = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none"
 /* Summary cell — same markup as Dim, with any unit (or none, for counts). */
 function Cell({ icon, label, value, unit = "", digits = 0, wide = false }) {
   return (
-    <div className="sp-dim" style={wide ? { gridColumn: "1 / -1" } : undefined}>
+    <div className={`sp-dim${wide ? " wide" : ""}`}>
       <div className="lbl">{icon}<span>{label}</span></div>
       <div className="val">
         {has(value)
           ? Number(value).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })
           : MISSING}
         {unit && <small>{unit}</small>}
-      </div>
-    </div>
-  );
-}
-
-
-/* -------------------------------------------------------
-   Blank state — shown until a scan with values is deployed
-------------------------------------------------------- */
-
-function BlankDashboard() {
-  return (
-    <div className="page">
-      <div className="pagehead">
-        <div>
-          <h1>Room Analysis</h1>
-          <p className="sub">No room scan deployed yet</p>
-        </div>
       </div>
     </div>
   );

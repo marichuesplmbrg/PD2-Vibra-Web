@@ -72,10 +72,34 @@ html, body, #root { height: 100%; margin: 0; }
   display: flex; align-items: center; gap: 12px; width: 100%;
   border: 0; cursor: pointer; background: transparent; color: var(--muted);
   padding: 10px 12px; border-radius: 11px; font-size: 14.5px; font-weight: 500;
-  text-align: left; text-decoration: none; transition: background .15s, color .15s;
+  text-align: left; text-decoration: none;
+  transform-origin: left center;
+  transition: background .15s, color .15s, transform .18s ease, opacity .18s ease;
 }
 .nav-item:hover { background: var(--panel); color: var(--ink); }
 .nav-item.active { background: var(--grad); color: #17131f; font-weight: 600; }
+
+/* Sidebar focus effect — the other items shrink.
+   At rest: every item except the active page shrinks.
+   On hover / keyboard focus: every item except the hovered one shrinks
+   (including the active page). Brand and divider are not affected. */
+.sidebar:has(.nav-item.active) .nav-item:not(.active) {
+  transform: scale(0.92);
+  opacity: 0.6;
+}
+.sidebar:has(.nav-item:hover, .nav-item:focus-visible)
+  .nav-item:not(:hover):not(:focus-visible) {
+  transform: scale(0.92);
+  opacity: 0.6;
+}
+.sidebar:has(.nav-item:hover, .nav-item:focus-visible) .nav-item:hover,
+.sidebar:has(.nav-item:hover, .nav-item:focus-visible) .nav-item:focus-visible {
+  transform: scale(1);
+  opacity: 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .nav-item { transition: background .15s, color .15s; }
+}
 
 .divider { height: 1px; background: var(--line); margin: 12px 6px; }
 .spacer { flex: 1; }
@@ -136,6 +160,10 @@ html, body, #root { height: 100%; margin: 0; }
   cursor: pointer; font-size: 14px; font-weight: 500;
 }
 .export:hover { background: var(--panel2); }
+/* Export report is disabled until a scan is deployed or picked — make that
+   visible (it used to look clickable), same as .btn:disabled. */
+.export:disabled { opacity: .45; cursor: not-allowed; }
+.export:disabled:hover { background: var(--panel); }
 
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 20px; }
 
@@ -223,7 +251,7 @@ html, body, #root { height: 100%; margin: 0; }
 
 .sim-canvas { width: 100%; height: 100%; display: block; }
 
-/* hot/dead legend dots inside the twin */
+/* legend dots inside the twin (the tooltip swatch is coloured inline by RT60) */
 .sim-dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
 
 /* orbit controls, bottom-right of the twin (replaces the static orbit-hint) */
@@ -330,6 +358,37 @@ html, body, #root { height: 100%; margin: 0; }
 /* ---- Parameters page ---- */
 .pt-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
 .pt-actions { display: flex; gap: 8px; margin-left: auto; }
+/* Reset confirmation — drops below the Reset button (uses .menu.right) */
+.reset-pop { display: flex; flex-direction: column; gap: 10px; padding: 8px 8px 6px; }
+.reset-msg { font-size: 13px; color: var(--muted); line-height: 1.5; }
+.reset-actions { display: flex; justify-content: flex-end; gap: 8px; }
+/* Buttons zoom on hover / keyboard focus (same feel as the History action
+   buttons). Parameters Table: Import, Deploy, Save, Export PDF, Reset and the
+   Cancel / Confirm reset pair in its dropdown. Dashboard: the .export button (anywhere)
+   and any .btn in the page header (room filter). Disabled buttons
+   stay still. Menu rows inside dropdowns are .menu-item, not .btn, so they
+   don't zoom. */
+.pt-toolbar .btn, .pagehead .btn, .export {
+  transition: transform .15s ease, box-shadow .15s ease, border-color .15s, background .15s;
+}
+.pt-toolbar .btn:hover:not(:disabled), .pt-toolbar .btn:focus-visible,
+.pagehead .btn:hover:not(:disabled), .pagehead .btn:focus-visible,
+.export:hover:not(:disabled), .export:focus-visible {
+  transform: scale(1.08);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .35);
+}
+.pt-toolbar .btn:active:not(:disabled),
+.pagehead .btn:active:not(:disabled),
+.export:active:not(:disabled) { transform: scale(1.02); }
+.pt-toolbar .btn:focus-visible, .pagehead .btn:focus-visible, .export:focus-visible {
+  outline: 2px solid var(--orange); outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pt-toolbar .btn, .pagehead .btn, .export { transition: none; }
+  .pt-toolbar .btn:hover:not(:disabled), .pt-toolbar .btn:focus-visible,
+  .pagehead .btn:hover:not(:disabled), .pagehead .btn:focus-visible,
+  .export:hover:not(:disabled), .export:focus-visible { transform: none; }
+}
 .pt-row { display: flex; gap: 22px; align-items: stretch; flex-wrap: wrap; }
 .pt-cell { flex: 1 1 420px; min-width: 0; min-height: 0; display: flex; }
 
@@ -477,7 +536,7 @@ html, body, #root { height: 100%; margin: 0; }
 .team-page {
   min-height: 100%;
   padding: 26px 34px 40px;
-  max-width: 1240px;
+  /* No max-width: the page stack spreads across the full content area. */
   color: var(--ink);
 }
 
@@ -590,17 +649,15 @@ html, body, #root { height: 100%; margin: 0; }
 .rg-gauge { margin-top: 12px; padding-top: 28px; }
 .rg-gauge-track {
   position: relative; height: 12px; border-radius: 999px;
-  background: linear-gradient(90deg,
-    color-mix(in srgb, var(--sim-dead, var(--cyan)) 45%, transparent),
-    color-mix(in srgb, var(--line) 80%, transparent) 45%,
-    color-mix(in srgb, var(--bad) 55%, transparent));
+  /* Fallback only — EchoGauge sets the real ramp inline, scaled to its axis. */
+  background: var(--rt-ramp, var(--line));
 }
 .rg-gauge-goal {
   position: absolute; top: -3px; bottom: -3px;
   left: var(--from); width: calc(var(--to) - var(--from));
   border-radius: 999px;
-  background: color-mix(in srgb, var(--ok) 55%, transparent);
-  border: 2px solid var(--ok);
+  background: transparent;         /* the ramp underneath is already green here */
+  border: 2px solid var(--ink);
 }
 .rg-gauge-you {
   position: absolute; top: 50%; left: var(--at);
@@ -723,3 +780,220 @@ html, body, #root { height: 100%; margin: 0; }
 @media (prefers-reduced-motion: reduce) {
   .rg-grade { transition: none; }
 }
+
+/* ============================================================
+   Dashboard — scanned-room filter
+   Uses the shared .menu / .menu-item / .chev / .pick-lbl classes.
+   ============================================================ */
+.pagehead-actions { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+.room-filter { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.room-filter-lbl {
+  font-size: 11.5px; letter-spacing: .9px; font-weight: 600;
+  color: var(--muted); text-transform: uppercase;
+}
+.room-menu { width: 320px; max-height: 360px; overflow-y: auto; }
+.menu-sep { height: 1px; background: var(--line); margin: 6px 4px; }
+.mi-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.mi-title { font-weight: 600; color: var(--ink); }
+.mi-sub { font-size: 12px; color: var(--muted); }
+.mi-end { display: flex; align-items: center; gap: 8px; flex: none; color: var(--orange); }
+.menu-item.active { background: color-mix(in srgb, var(--orange) 10%, transparent); }
+
+/* full-width summary cell (was an inline style) */
+.sp-dim.wide { grid-column: 1 / -1; }
+
+/* ============================================================
+   Simulation — sound heatmap scale (RT60 colour ramp)
+   blue < 0.2 s (dead) · green 0.2–0.4 s (target) · orange 0.4–0.6 s
+   · yellow 0.6–0.8 s · red 0.8 s+.
+   The real stops live in HEAT_STOPS in Simulation.jsx and are applied
+   inline (legend bar, echo gauge). The gradients here are only
+   fallbacks — if you change the colours, change HEAT_STOPS; update
+   these to match only so the pre-JS paint isn't wrong.
+   ============================================================ */
+:root {
+  --rt-deep: #2446c8;
+  --rt-dead: #5b9dff;
+  --rt-good: #34d17a;
+  --rt-orange: #ff9a3c;
+  --rt-yellow: #ffd84a;
+  --rt-red: #ff4b4b;
+  --rt-ramp: linear-gradient(90deg,
+    var(--rt-deep) 0%, var(--rt-dead) 14.1%, var(--rt-good) 21.2%, var(--rt-good) 37.6%,
+    var(--rt-orange) 47.1%, var(--rt-yellow) 67.1%, var(--rt-red) 88.2%);
+}
+.heat-legend { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+.heat-bar {
+  display: inline-block; width: 140px; height: 8px; border-radius: 999px;
+  background: var(--rt-ramp);
+}
+/* Layer-list dot for the Sound heatmap row: the ramp, not a single colour. */
+.layer-dot.heat { background: conic-gradient(var(--rt-dead), var(--rt-good), var(--rt-orange), var(--rt-yellow), var(--rt-red), var(--rt-dead)); }
+
+/* ============================================================
+   History — action buttons grow on hover / keyboard focus
+   ============================================================ */
+.hist-actions .btn {
+  transition: transform .15s ease, box-shadow .15s ease, border-color .15s;
+}
+.hist-actions .btn:hover:not(:disabled),
+.hist-actions .btn:focus-visible {
+  transform: scale(1.08);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .35);
+}
+.hist-actions .btn:active:not(:disabled) { transform: scale(1.02); }
+.hist-actions .btn:focus-visible { outline: 2px solid var(--orange); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .hist-actions .btn { transition: none; }
+  .hist-actions .btn:hover:not(:disabled),
+  .hist-actions .btn:focus-visible { transform: none; }
+}
+
+/* ============================================================
+   History — list focus effect (same idea as the sidebar)
+   While one saved scan is hovered or has keyboard focus inside it,
+   every other card shrinks and dims. Nothing changes at rest.
+   ============================================================ */
+.hist-card {
+  transition: transform .18s ease, opacity .18s ease, border-color .18s ease;
+}
+.hist-list:has(.hist-card:hover, .hist-card:focus-within)
+  .hist-card:not(:hover):not(:focus-within) {
+  transform: scale(0.96);
+  opacity: 0.55;
+}
+.hist-list:has(.hist-card:hover, .hist-card:focus-within) .hist-card:hover,
+.hist-list:has(.hist-card:hover, .hist-card:focus-within) .hist-card:focus-within {
+  border-color: color-mix(in srgb, var(--violet) 45%, var(--line));
+}
+@media (prefers-reduced-motion: reduce) {
+  .hist-card { transition: opacity .18s ease, border-color .18s ease; }
+  .hist-list:has(.hist-card:hover, .hist-card:focus-within)
+    .hist-card:not(:hover):not(:focus-within) { transform: none; }
+}
+
+/* ============================================================
+   Team — stacked "book pages"
+   Each member is a page. Pages overlap left to right with only an
+   edge showing; the first page sits on top. Hovering (or tabbing to)
+   a page pulls it to the front and lifts it, and the other pages dim
+   and shrink slightly. On narrow screens the stack becomes a list.
+   ============================================================ */
+.team-stack {
+  /* The stack fills the content width. A page is ~42% of the stack's width,
+     capped so it never gets taller than the screen, and the remaining width
+     is shared out as the visible edges of the other pages. */
+  container-type: inline-size;
+  --count: 5;           /* members; set by the :has() rules below */
+  width: 100%;
+  display: flex;
+  /* stretch: every page takes the height of the tallest one, so a long
+     name that wraps to two lines can't make one page stick out. */
+  align-items: stretch;
+  padding: 10px 0 24px;
+  overflow-x: auto;
+  overflow-y: visible;
+}
+.team-stack:has(> :nth-child(2):last-child) { --count: 2; }
+.team-stack:has(> :nth-child(3):last-child) { --count: 3; }
+.team-stack:has(> :nth-child(4):last-child) { --count: 4; }
+.team-stack:has(> :nth-child(6):last-child) { --count: 6; }
+.team-stack:has(> :nth-child(7):last-child) { --count: 7; }
+.team-stack:has(> :nth-child(8):last-child) { --count: 8; }
+
+.team-page-card {
+  --page-w: min(42cqi, 520px, calc((100vh - 330px) / 1.3));
+  --peek: calc((100cqi - var(--page-w)) / (var(--count) - 1));
+  position: relative;
+  flex: 0 0 var(--page-w);
+  width: var(--page-w);
+  margin-left: calc(var(--peek) - var(--page-w));
+  border-radius: 18px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--violet) 55%, transparent);
+  box-shadow: -10px 0 24px rgba(0, 0, 0, .35);
+  cursor: pointer;
+  outline: none;
+  display: flex;
+  flex-direction: column;
+  transform-origin: left center;
+  transition: transform .25s ease, filter .25s ease, box-shadow .25s ease, border-color .25s ease;
+}
+.team-page-card:first-child { margin-left: 0; }
+
+/* Page shades, deepest on top — like the reference. Order sets the stacking. */
+.team-page-card:nth-child(1) { z-index: 8; background: color-mix(in srgb, var(--violet) 42%, var(--panel)); }
+.team-page-card:nth-child(2) { z-index: 7; background: color-mix(in srgb, var(--violet) 52%, var(--panel)); }
+.team-page-card:nth-child(3) { z-index: 6; background: color-mix(in srgb, var(--violet) 62%, var(--panel)); }
+.team-page-card:nth-child(4) { z-index: 5; background: color-mix(in srgb, var(--violet) 72%, var(--panel)); }
+.team-page-card:nth-child(5) { z-index: 4; background: color-mix(in srgb, var(--violet) 82%, var(--panel)); }
+.team-page-card:nth-child(6) { z-index: 3; background: color-mix(in srgb, var(--violet) 88%, var(--panel)); }
+.team-page-card:nth-child(7) { z-index: 2; background: color-mix(in srgb, var(--violet) 92%, var(--panel)); }
+.team-page-card:nth-child(8) { z-index: 1; background: color-mix(in srgb, var(--violet) 96%, var(--panel)); }
+
+.team-page-photo {
+  aspect-ratio: 1 / 1.05;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--panel2);
+}
+.team-page-photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.team-page-info {
+  flex: 1;              /* fills the page, so short names get the same box */
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+}
+.team-page-info h3 { margin: 0 0 4px; font-size: 18px; font-weight: 700; color: var(--ink); }
+.team-page-info p { margin: 0; font-size: 14.5px; color: var(--muted); }
+
+/* First name printed up the visible edge, so a covered page is still findable. */
+.team-page-tab {
+  position: absolute;
+  top: 18px; right: 10px; bottom: 18px;
+  width: calc(var(--peek) - 24px);
+  display: flex; align-items: center; justify-content: center;
+  writing-mode: vertical-rl;
+  font-size: 16px; font-weight: 700; letter-spacing: .8px;
+  color: rgba(255, 255, 255, .9);
+  text-shadow: 0 1px 6px rgba(0, 0, 0, .6);
+  pointer-events: none;
+  transition: opacity .2s ease;
+}
+
+/* Front page: hovered or keyboard-focused. */
+.team-page-card:hover,
+.team-page-card:focus-visible,
+.team-page-card:focus-within {
+  z-index: 20;
+  transform: translateY(-8px);
+  border-color: var(--violet);
+  box-shadow: -14px 10px 34px rgba(0, 0, 0, .5);
+}
+.team-page-card:hover .team-page-tab,
+.team-page-card:focus-visible .team-page-tab { opacity: 0; }
+
+/* While one page is in front, the rest shrink and dim. */
+.team-stack:has(.team-page-card:hover, .team-page-card:focus-visible)
+  .team-page-card:not(:hover):not(:focus-visible) {
+  transform: scale(0.96);
+  /* brightness, not opacity: a see-through page would show the pages
+     beneath it and the names would overlap. */
+  filter: brightness(0.55) saturate(0.8);
+}
+
+@media (max-width: 640px) {
+  .team-stack { flex-direction: column; gap: 14px; overflow: visible; }
+  .team-page-card { margin-left: 0; width: 100%; flex-basis: auto; --page-w: 100%; }
+  .team-page-tab { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .team-page-card { transition: filter .2s ease, border-color .2s ease; }
+  .team-page-card:hover,
+  .team-page-card:focus-visible,
+  .team-stack:has(.team-page-card:hover, .team-page-card:focus-visible)
+    .team-page-card:not(:hover):not(:focus-visible) { transform: none; }
+}
+/* The first page is the open one at rest, so it doesn't need an edge label. */
+.team-page-card:first-child .team-page-tab { display: none; }

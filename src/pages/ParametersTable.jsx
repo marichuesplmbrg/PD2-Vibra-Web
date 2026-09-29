@@ -766,14 +766,26 @@ ${sections.map(sectionHtml).join("")}
           <button className="btn" onClick={exportPdf} disabled={!hasSheets} title="Export the whole page as PDF">
             <Download size={15} color="var(--muted)" /><span>Export PDF</span>
           </button>
-          {resetArmed ? (
-            <>
-              <button className="btn btn--danger" onClick={resetAll}>Confirm reset</button>
-              <button className="btn btn--ghost" onClick={() => setResetArmed(false)}>Cancel</button>
-            </>
-          ) : (
-            <button className="btn" onClick={() => setResetArmed(true)} disabled={!hasSheets}><RotateCcw size={15} color="var(--muted)" /><span>Reset</span></button>
-          )}
+          {/* Reset confirms in a small panel that drops DOWN from the button,
+              so the toolbar never changes width and nothing shifts sideways. */}
+          <div className="menu-wrap">
+            <button className="btn" onClick={() => setResetArmed((v) => !v)} disabled={!hasSheets}
+              aria-haspopup="dialog" aria-expanded={resetArmed}>
+              <RotateCcw size={15} color="var(--muted)" /><span>Reset</span>
+            </button>
+            {resetArmed && (
+              <Menu right width={260} onClose={() => setResetArmed(false)}>
+                <div className="reset-pop" role="dialog" aria-label="Confirm reset"
+                  onKeyDown={(e) => { if (e.key === "Escape") setResetArmed(false); }}>
+                  <div className="reset-msg">Clear the current scan data? Anything saved in History stays.</div>
+                  <div className="reset-actions">
+                    <button className="btn btn--ghost" onClick={() => setResetArmed(false)}>Cancel</button>
+                    <button className="btn btn--danger" onClick={resetAll} autoFocus>Confirm reset</button>
+                  </div>
+                </div>
+              </Menu>
+            )}
+          </div>
         </div>
       </div>
 
