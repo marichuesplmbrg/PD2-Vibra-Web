@@ -717,6 +717,33 @@ html, body, #root { height: 100%; margin: 0; }
 .rg-grade-name { font-weight: 700; }
 .rg-grade-cls { font-size: 12px; color: var(--orange); font-weight: 600; }
 .rg-grade-note { font-size: 12px; color: var(--muted); }
+.rg-grade-eg { margin-top: 4px; font-size: 11.5px; line-height: 1.4; color: var(--faint); }
+.rg-grade.on .rg-grade-eg { color: var(--muted); }
+
+/* Absorber options (ISO 11654 class examples) ------------------------------- */
+.rg-options {
+  margin-top: 12px; padding: 14px 16px; border-radius: 12px; min-width: 0;
+  border: 1px solid var(--line); background: color-mix(in srgb, var(--ink) 2.5%, transparent);
+}
+.rg-options-title { font-weight: 700; font-size: 13.5px; color: var(--ink); }
+.rg-option-list {
+  list-style: none; margin: 10px 0 0; padding: 0;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px;
+}
+.rg-option {
+  display: flex; flex-direction: column; gap: 3px; min-width: 0;
+  padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
+  border-left: 3px solid var(--orange);
+}
+.rg-option-name { font-weight: 600; font-size: 13.5px; color: var(--ink); }
+.rg-option-note { font-size: 12.5px; line-height: 1.45; color: var(--muted); }
+.rg-step-body p.rg-caveat { margin-top: 10px; font-size: 12.5px; color: var(--faint); }
+
+/* Technical table — "Typical options" column */
+.aw-eg {
+  padding: 6px 10px; text-align: left; vertical-align: top;
+  min-width: 220px; color: var(--muted); line-height: 1.45;
+}
 
 /* Result -------------------------------------------------------------------- */
 .rg-result {

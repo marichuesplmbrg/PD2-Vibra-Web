@@ -1652,7 +1652,7 @@ function AwTable({ plan }) {
   const head = { ...cell, fontWeight: 600, opacity: 0.7, borderBottom: "1px solid rgba(255,255,255,0.10)" };
   return (
     <div style={{ marginTop: 12, overflowX: "auto", minWidth: 0, maxWidth: "100%" }}>
-      <table style={{ borderCollapse: "collapse", fontSize: "0.86em", width: "100%", maxWidth: 520 }}>
+      <table style={{ borderCollapse: "collapse", fontSize: "0.86em", width: "100%", maxWidth: 820 }}>
         <thead>
           <tr>
             <th style={{ ...head, textAlign: "left" }}>ISO class</th>
@@ -1660,6 +1660,7 @@ function AwTable({ plan }) {
             <th style={head}>Min αw</th>
             <th style={head}>Area required</th>
             <th style={head}>Of wall + ceiling</th>
+            <th style={{ ...head, textAlign: "left" }}>Typical options</th>
           </tr>
         </thead>
         <tbody>
@@ -1670,6 +1671,7 @@ function AwTable({ plan }) {
               <td style={cell}>{c.aw.toFixed(2)}</td>
               <td style={cell}>{c.ok ? `${c.area.toFixed(1)} m²` : "not achievable"}</td>
               <td style={cell}>{c.ok ? `${c.pct.toFixed(0)}%` : "—"}</td>
+              <td className="aw-eg">{(ABSORBER_OPTIONS[c.cls] || []).map((o) => o.name).join(" · ")}</td>
             </tr>
           ))}
         </tbody>
@@ -1678,7 +1680,8 @@ function AwTable({ plan }) {
         Room volume {plan.V.toFixed(1)} m³ · treatable surface {plan.treatable.toFixed(1)} m² ·
         current ᾱ {plan.aBar.toFixed(2)} · deficit {plan.dA >= 0 ? "+" : ""}{plan.dA.toFixed(1)} m² sabins.
         Derived from {plan.model || "Sabine"} (RT60 = 0.161 V / A); floor excluded from treatable area.
-        Areas sized at each class's lowest αw (ISO 11654 Annex B).
+        Areas sized at each class's lowest αw (ISO 11654 Annex B). Typical options are indicative —
+        the class is a property of a tested product and its mounting (ISO 354), not of the material name.
       </div>
       {!plan.feasible && (
         <div style={{ marginTop: 8, fontSize: "0.82em", lineHeight: 1.5, padding: "8px 10px", borderRadius: 8, background: "rgba(255,91,82,0.10)", border: "1px solid rgba(255,91,82,0.30)" }}>
@@ -1756,6 +1759,45 @@ function SpotAllocTable({ alloc, basis }) {
 
 // Plain names for the ISO 11654 classes — what a shopper actually weighs.
 const GRADE_NAME = { A: "Best", B: "Very good", C: "Good", D: "Basic" };
+
+/* ---- absorber options per ISO 11654 class -------------------------------- *
+ * Typical treatments that usually test into each Annex B class. These are
+ * indicative only: the class belongs to a tested product + mounting (ISO 354
+ * measurement, ISO 11654 rating), so the same curtain can be Class D pleated
+ * off the wall and Class E hung flat against it. The plan sizes area by class,
+ * never by material — these lists only show what a class looks like in a shop.
+ * Class E is listed for the deadspot advice (surfaces that should stay
+ * reflective); it is never offered as treatment.
+ * ------------------------------------------------------------------------ */
+const ABSORBER_OPTIONS = {
+  A: [
+    { name: "Acoustic panels (thick)", note: "fabric-wrapped mineral or glass wool, mounted with an air gap behind" },
+    { name: "Ceiling baffles / clouds", note: "hung below the ceiling so both faces absorb" },
+    { name: "Polyester (PET) fibre panels (thick)", note: "mounted with an air gap behind" },
+  ],
+  B: [
+    { name: "Acoustic panels", note: "fabric-wrapped fibreglass" },
+    { name: "Acoustic foam (thick)", note: "wedge or pyramid profile" },
+    { name: "Acoustic ceiling tiles", note: "mineral fibre, in a suspended grid" },
+  ],
+  C: [
+    { name: "Acoustic foam", note: "standard sheets" },
+    { name: "PET felt panels", note: "mid-thickness, or thinner on an air gap" },
+    { name: "Acoustic curtains (rated)", note: "multi-layer acoustic drapes, deeply pleated" },
+  ],
+  D: [
+    { name: "Heavy curtains", note: "lined and pleated, hung away from the wall" },
+    { name: "Thin felt or foam panels", note: "fixed flat to the wall" },
+    { name: "Fabric wall coverings", note: "felt or fabric pinboard over a soft backing" },
+  ],
+  E: [
+    { name: "Light curtains", note: "thin, unlined, hung flat" },
+    { name: "Bare hard surfaces", note: "plaster, painted concrete, wood, glass" },
+  ],
+};
+const optionNames = (cls) => (ABSORBER_OPTIONS[cls] || []).map((o) => o.name.toLowerCase());
+const listText = (arr) =>
+  arr.length <= 1 ? arr.join("") : `${arr.slice(0, -1).join(", ")} or ${arr[arr.length - 1]}`;
 
 // Put an area into a size a person can picture: the side of an equal square.
 // Deliberately names no material or product; only size, grade and thickness.
@@ -1859,9 +1901,6 @@ function ThicknessBasis() {
 }
 const areaText = (m2) => (m2 < 0.1 ? `${(m2 * 10000).toFixed(0)} cm²` : `${m2.toFixed(2)} m²`);
 
-// Bearing -> the side of the room it points at, using the twin's cardinals.
-const COMPASS = ["north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"];
-const sideOf = (deg) => COMPASS[Math.round((((deg % 360) + 360) % 360) / 45) % 8];
 
 function EchoGauge({ rt }) {
   const max = Math.max(1, rt * 1.15, RT60_TARGET.high * 1.6);
@@ -1904,17 +1943,30 @@ function GradePicker({ options, value, onChange }) {
           <span className="rg-grade-note">
             {c.ok ? `Soaks up ${Math.round(c.aw * 100)}%+ of sound` : "Not enough on its own"}
           </span>
+          <span className="rg-grade-eg">e.g. {listText(optionNames(c.cls))}</span>
         </button>
       ))}
     </div>
   );
 }
 
-function ShareBar({ pct }) {
+/* What a chosen ISO 11654 class can be bought as — curtains, panels, foam,
+   tiles — with the mounting that gets it there. Indicative, not a spec. */
+function AbsorberOptions({ cls }) {
+  const opts = ABSORBER_OPTIONS[cls] || [];
+  if (!opts.length) return null;
   return (
-    <span className="rg-bar" aria-hidden="true">
-      <span className="rg-bar-fill" style={{ "--w": `${Math.max(2, Math.min(100, pct)).toFixed(0)}%` }} />
-    </span>
+    <div className="rg-options">
+      <div className="rg-options-title">Options that usually reach Class {cls}</div>
+      <ul className="rg-option-list">
+        {opts.map((o) => (
+          <li key={o.name} className="rg-option">
+            <span className="rg-option-name">{o.name}</span>
+            <span className="rg-option-note">{o.note}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
@@ -1957,9 +2009,6 @@ function RecommendationGuide({ model, counts }) {
       lead: `Sound fades in ${rt.toFixed(1)} seconds, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} second goal. No treatment is needed.`,
     },
   }[state];
-
-  const localAw = plan ? Math.max(0.6, Math.min(1, toAwStep(plan.awRaw + 0.1))) : 0.8;
-  const localCls = isoClassOf(localAw);
 
   const tips = [];
   if (alloc && !alloc.diffuse) tips.push({
@@ -2022,66 +2071,33 @@ function RecommendationGuide({ model, counts }) {
                 </p>
               ) : (
                 <>
-                  <p>Pick a quality grade. The better the grade, the less you need. The grade is printed on the product.</p>
+                  <p>
+                    Pick a quality grade. The better the grade, the less material you need. The grade is printed on the
+                    product. The exact amount for each grade is under Technical details.
+                  </p>
                   <GradePicker options={options} value={chosen.cls} onChange={setPick} />
-                  <div className="rg-result">
-                    <div className="rg-result-big">{areaText(chosen.area)}</div>
-                    <div className="rg-result-text">
-                      of <b>{GRADE_NAME[chosen.cls].toLowerCase()} (Class {chosen.cls})</b> sound absorption, {relatableArea(chosen.area)}.
-                      <span className="rg-result-sub">
-                        <ShareBar pct={chosen.pct} /> That covers {chosen.pct < 1 ? "under 1" : chosen.pct.toFixed(0)}% of your walls and ceiling.
-                      </span>
-                    </div>
-                  </div>
+                  <AbsorberOptions cls={chosen.cls} />
                 </>
               )}
               {plan && <ThicknessGuide bands={model.bands} room={model.room} />}
             </div>
           </div>
-
-          {counts.hot > 0 && (
-            <div className="rg-step">
-              <span className="rg-step-num">2</span>
-              <div className="rg-step-body">
-                <div className="rg-step-title">Put them where it's loudest</div>
-                <p>
-                  The scan found {counts.hot} loud spot{counts.hot > 1 ? "s" : ""} — shown in red in the twin above.
-                  Place the absorption on the wall each one faces, starting with the loudest.
-                </p>
-                {alloc && (
-                  <ul className="rg-where">
-                    {alloc.rows.map((r, i) => (
-                      <li key={r.idx}>
-                        <span className="rg-where-name">
-                          {numish(r.angle) ? `${sideOf(r.angle)[0].toUpperCase()}${sideOf(r.angle).slice(1)} wall` : `Loud spot ${r.idx}`}
-                          {i === 0 && <span className="rg-chip">loudest</span>}
-                        </span>
-                        <ShareBar pct={r.share * 100} />
-                        <span className="rg-where-amt">{(r.share * 100).toFixed(0)}% · {areaText(r.area)}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {plan && localCls !== "Not classified" && (
-                  <p className="rg-hint">
-                    On the two surfaces nearest the loudest spot, use a {GRADE_NAME[localCls]?.toLowerCase() || "higher"} grade (Class {localCls}) or better.
-                  </p>
-                )}
-              </div>
-            </div>
-          )}
         </>
       )}
 
       {counts.dead > 0 && state !== "ok" && (
         <div className="rg-step">
-          <span className="rg-step-num">{state === "echoey" ? (counts.hot > 0 ? 3 : 2) : 2}</span>
+          <span className="rg-step-num">2</span>
           <div className="rg-step-body">
             <div className="rg-step-title">Leave the quiet spots bare</div>
             <p>
               {counts.dead} spot{counts.dead > 1 ? "s are" : " is"} already too quiet — shown in blue in the twin.
               Absorption there would make it worse. If they matter, move the sound source or add a surface that
               scatters sound (diffusion) instead.
+            </p>
+            <p className="rg-hint">
+              Keep those surfaces below Class D — {listText(optionNames("E"))} are fine. Avoid heavy curtains,
+              foam or acoustic panels there.
             </p>
           </div>
         </div>
