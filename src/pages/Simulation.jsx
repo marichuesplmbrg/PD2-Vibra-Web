@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import * as THREE from "three";
-import { Play, Pause, RotateCw, Radio, Target, TrendingDown, TrendingUp, CheckCircle2, Volume2, AlertCircle, AlertTriangle } from "lucide-react";
+import { Play, Pause, RotateCw, Radio, Target, Volume2, AlertCircle, AlertTriangle } from "lucide-react";
 import { vibraHistory } from "./vibraHistory";
 
 /* Colors come from styles.css tokens (config.js overrides at runtime). This
@@ -92,6 +92,15 @@ const HEAT_STOPS = [
   [0.45, "#ff9a3c"], // orange
   [0.62, "#ffd84a"], // yellow
   [0.80, "#ff4b4b"], // red — full-strength hotspot
+];
+// Colour key shown under the Layers checklist. Swatches use the same hex
+// values as HEAT_STOPS; change both together.
+const HEAT_LEGEND = [
+  { color: "#5b9dff", label: "Deadspot", range: "< 0.2 s" },
+  { color: "#34d17a", label: "Target (neutral)", range: "0.2 – 0.4 s" },
+  { color: "#ff9a3c", label: "Hotspot · mild", range: "0.4 – 0.6 s" },
+  { color: "#ffd84a", label: "Hotspot · strong", range: "0.6 – 0.8 s" },
+  { color: "#ff4b4b", label: "Hotspot · severe", range: "≥ 0.8 s" },
 ];
 const HEAT_STOPS_RGB = HEAT_STOPS.map(([t, hx]) => [t, hexToRgb(hx.slice(1))]);
 function heatRt(s) {
@@ -431,21 +440,36 @@ function parseDeployment(dep) {
     // reading is ray-cast from room centre onto the wall it points at.
     if (c.angleI >= 0 && room.w && room.l) {
       const hx = (room.w / 2) * 0.94, hz = (room.l / 2) * 0.94;
+      // The sweep always STARTS facing north. The sensor logs its own angle
+      // (servo / stepper position), which need not be 0 at the start — so
+      // the first reading collected (first labelled row, in the order the
+      // device wrote them) is taken as north, and every other reading is
+      // measured from it: bearing = logged angle − first logged angle.
+      const firstRow = c.rows.find((r) => hasLabel(r) && numish(r[c.angleI]));
+      const angleZero = firstRow ? parseFloat(firstRow[c.angleI]) : 0;
       const out = c.rows.map((r) => {
         if (!hasLabel(r)) return null;
-        const deg = parseFloat(r[c.angleI]);
-        if (!numish(deg)) return null;
+        const raw = parseFloat(r[c.angleI]);
+        if (!numish(raw)) return null;
+        // Compass bearing: 0° = north, increasing clockwise (90° east,
+        // 180° south, 270° west) — the same frame as the N/E/S/W labels on
+        // the twin, where north is -z and east is +x. Wrapped into 0–360.
+        const deg = ((((raw - angleZero) % 360) + 360) % 360);
         const rad = (deg * Math.PI) / 180;
-        const dx = Math.cos(rad), dz = Math.sin(rad);
+        const dx = Math.sin(rad), dz = -Math.cos(rad);
         const tx = Math.abs(dx) < 1e-6 ? Infinity : hx / Math.abs(dx);
         const tz = Math.abs(dz) < 1e-6 ? Infinity : hz / Math.abs(dz);
         const tt = Math.min(tx, tz); // first wall the bearing meets
         if (!isFinite(tt)) return null;
-        return { x: dx * tt, z: dz * tt, type: readType(r), value: readValue(r), angle: deg };
+        return { x: dx * tt, z: dz * tt, type: readType(r), value: readValue(r), angle: deg, rawAngle: raw };
       }).filter(Boolean);
       if (out.length) {
+        // Readings always run from 0° (north) clockwise, whatever order
+        // the rows arrived in.
+        out.sort((a, b) => a.angle - b.angle);
         spots = out; spotsFrom = c.name;
         spotsAreBearings = true;
+        if (angleZero !== 0) console.info(`[VIBRA] sweep started at ${angleZero}° (sensor angle) — rotated so the first reading sits at north (0°).`);
         break;
       }
     }
@@ -594,6 +618,19 @@ function auditDeployment(dep, model) {
       title: `Invalid parameter — “${name}” is not numeric`,
       body: `${list.length} row${list.length > 1 ? "s" : ""} in “${cls.name}” hold a non-numeric value for “${name}” (${rowRef(list)}). Those readings are dropped from the twin.`,
     }));
+
+    // The first reading collected is taken as north (see the bearing placement in the model parser). Say so
+    // when the sensor's own angle didn't start at 0, so the rotation is visible.
+    if (ai >= 0) {
+      const first = cls.rows.find((r) => ci >= 0 && String(r[ci] ?? "").trim() !== "" && numish(r[ai]));
+      const zero = first ? parseFloat(first[ai]) : 0;
+      if (first && Math.abs(zero) > 0.5) {
+        warnings.push({
+          title: `Sweep rotated to start at north`,
+          body: `The first reading in “${cls.name}” was logged at ${zero}° by the sensor. The sweep always starts facing north, so that reading is placed at 0° (N) and every other reading is measured clockwise from it (logged angle − ${zero}°). Make sure the sensor is pointed north before each sweep.`,
+        });
+      }
+    }
   }
 
   /* --- reverberation --- */
@@ -972,7 +1009,7 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
       // What the heatmap is actually painting, per reading — check here first
       // if every patch looks the same strength (e.g. RT60 column not found).
       console.info("[VIBRA] heatmap readings", model.spots.map((sp) => ({
-        label: sp.type, rt60_s: sp.value, bearing: sp.angle, rt60_used: +heatRt(sp).toFixed(3), colour: rtToCss(heatRt(sp)),
+        label: sp.type, rt60_s: sp.value, bearing: sp.angle, sensor_angle: sp.rawAngle, rt60_used: +heatRt(sp).toFixed(3), colour: rtToCss(heatRt(sp)),
       })));
       if (model.spots.every((sp) => sp.value == null))
         console.warn("[VIBRA] heatmap: no RT60 values found in the classification tab — every reading uses its label's fallback RT60 (hot 0.6 s / neutral 0.3 s / dead 0.1 s).");
@@ -1340,14 +1377,18 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
               lineHeight: 1.55, textAlign: "left", fontSize: "0.86em",
             }}
           >
+            {/* Heatmap colour key — same colours as HEAT_STOPS. */}
             <div style={{ margin: 0 }}>
-              Colour follows the measured RT60: blue is a deadspot (below 0.2 s), green is the
-              0.2–0.4 s target band, then orange (0.4–0.6 s), yellow (0.6–0.8 s) and red (0.8 s and
-              above). Colour between readings is a kernel-weighted average of the nearby RT60 values and fades out
-              where no reading is close. Bearing-only scans are interpolated by direction around
-              the sensor, so colour shows where each reading faced, not a localised sound source.
-              The mic is omnidirectional, so colour runs floor to ceiling at even strength — the
-              readings carry no height information. Small ticks mark the readings — hover one for details.
+              <div style={{ fontWeight: 700, color: "var(--ink)", marginBottom: 8 }}>Heatmap colour · RT60</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                {HEAT_LEGEND.map((it) => (
+                  <div key={it.range} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span aria-hidden="true" style={{ width: 22, height: 12, borderRadius: 4, flex: "none", background: it.color }} />
+                    <span style={{ color: "var(--ink)", flex: "1 1 auto" }}>{it.label}</span>
+                    <span style={{ color: "var(--muted)", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{it.range}</span>
+                  </div>
+                ))}
+              </div>
             </div>
             {/* The empty-spot case is reported by the parameter panel above the
                 boxes, where it can name the column that is actually missing —
@@ -1419,15 +1460,6 @@ const ISO_CLASSES = [
 // is "hardly absorbing" and is not offered as treatment.
 const TREATMENT_CLASSES = ISO_CLASSES.filter((c) => c.min >= 0.30).slice().reverse();
 
-function isoClassOf(aw) {
-  const hit = ISO_CLASSES.find((c) => aw >= c.min - 1e-9);
-  return hit ? hit.cls : "Not classified";
-}
-// "αw 0.60 (Class C)" — the form used in every card and table below.
-const awText = (aw) => {
-  const c = isoClassOf(aw);
-  return `αw ${aw.toFixed(2)} (${c === "Not classified" ? "not classified" : `Class ${c}`})`;
-};
 
 function roomGeometry(room) {
   const w = room.w, l = room.l, h = room.h || 2.6;
@@ -1452,10 +1484,91 @@ function absorptionFor(V, S, rt60) {
   return { A: S * aBar, model: "Eyring" };
 }
 
-function acousticPlan(room, rt60) {
+/* ---- sound goal -------------------------------------------------------- *
+ * Hotspots and deadspots both have a place in a room; which the client wants
+ * depends on what the room is for. The goals use the classifier's own
+ * thresholds, nothing new:
+ *     below 0.2 s      dead     (deadspot)
+ *     0.2 – 0.4 s      neutral  (balanced)
+ *     above 0.4 s      live     (hotspot)
+ * The CLASSIFICATION and heatmap are untouched — they describe what the room
+ * IS. The goal only changes what the recommendation asks for:
+ *   - the room-wide RT60 the Sabine / Eyring plan aims at, and
+ *   - a verdict for every measured direction: absorb, diffuse, or leave.
+ *
+ *   Dry       every direction dead        room aims at 0.19 s
+ *   Balanced  a mix — Live End–Dead End:  room aims at 0.30 s (band centre)
+ *             the side the client faces stays dead or neutral, the side
+ *             behind stays neutral or live
+ *   Live      every direction live        room aims at 0.41 s
+ * Dry and Live aim GOAL_MARGIN past the threshold: the smallest change that
+ * actually moves the room into that class (exactly 0.2 s or 0.4 s is still
+ * neutral, since the classes are "below 0.2" and "above 0.4").
+ * ------------------------------------------------------------------------ */
+const ZONE_RANK = { dead: 0, neutral: 1, hot: 2 };
+const GOAL_MARGIN = 0.01; // s past the threshold, so the target is inside the class
+const rtClass = (rt) => (rt < RT60_LO ? "dead" : rt > RT60_HI ? "hot" : "neutral");
+const SOUND_GOALS = [
+  { key: "dry", name: "Dry", range: `below ${RT60_LO} s`, use: "Vocal booth · podcast · voice-over",
+    room: [0, 0], aim: RT60_LO - GOAL_MARGIN, band: { low: 0, high: RT60_LO },
+    blurb: "Quiet everywhere." },
+  { key: "balanced", name: "Balanced", range: `${RT60_LO}–${RT60_HI} s`, use: "Home studio · mixing · practice room",
+    room: [1, 1], aim: (RT60_LO + RT60_HI) / 2, band: { low: RT60_LO, high: RT60_HI },
+    blurb: "Quiet in front, lively behind." },
+  { key: "live", name: "Live", range: `above ${RT60_HI} s`, use: "Acoustic music · rehearsal · ensemble",
+    room: [2, 2], aim: RT60_HI + GOAL_MARGIN, band: { low: RT60_HI, high: Infinity },
+    blurb: "Lively everywhere." },
+];
+const goalOf = (key) => SOUND_GOALS.find((g) => g.key === key) || SOUND_GOALS[1];
+const FACINGS = [
+  { key: "N", deg: 0, name: "North" }, { key: "E", deg: 90, name: "East" },
+  { key: "S", deg: 180, name: "South" }, { key: "W", deg: 270, name: "West" },
+];
+// The same direction named from where the client sits: the wall they face is
+// "front", and compass bearings run clockwise, so +90° is on their right.
+const REL8 = ["Front wall", "Front-right corner", "Right wall", "Back-right corner",
+  "Back wall", "Back-left corner", "Left wall", "Front-left corner"];
+const relOf = (deg, facingDeg) => REL8[Math.round((((deg - facingDeg) % 360) + 360) % 360 / 45) % 8];
+// Compass bearing of a reading: its own angle, or (X/Y scans) the direction of
+// its position from the room centre — north is −z, east is +x.
+const bearingOf = (s) => (numish(s.angle)
+  ? Number(s.angle)
+  : (((Math.atan2(s.x, -s.z) * 180) / Math.PI) + 360) % 360);
+const angGap = (a, b) => { const d = (((a - b) % 360) + 360) % 360; return d > 180 ? 360 - d : d; };
+
+/* Which classes a reading at `bearing` may be in, for this goal (as ranks). */
+function zoneFor(goal, facingDeg, bearing) {
+  if (goal.key === "dry") return { side: "dead", ok: [0, 0] };
+  if (goal.key === "live") return { side: "live", ok: [2, 2] };
+  return angGap(bearing, facingDeg) <= 90
+    ? { side: "dead", ok: [0, 1] }   // in front: dead or neutral, not live
+    : { side: "live", ok: [1, 2] };  // behind: neutral or live, not dead
+}
+
+/* One verdict per measured reading: livelier than its zone allows → absorb,
+   deader than its zone allows → diffuse / reflect, otherwise leave it. The
+   class comes from the RT60 value (same thresholds as the classifier), or
+   from the sheet's label when a reading has no value. */
+function zoneVerdicts(spots, goal, facingDeg) {
+  return (spots || []).map((s, i) => {
+    const bearing = bearingOf(s);
+    const zone = zoneFor(goal, facingDeg, bearing);
+    const cls = numish(s.value) ? rtClass(Number(s.value)) : (s.type in ZONE_RANK ? s.type : "neutral");
+    const r = ZONE_RANK[cls];
+    const action = r > zone.ok[1] ? "absorb" : r < zone.ok[0] ? "diffuse" : "leave";
+    return { ...s, idx: i + 1, bearing, zone, cls, action };
+  });
+}
+/* Room-wide: is the room's average RT60 too live, too dead, or right? */
+const roomState = (rt, goal) => {
+  const r = ZONE_RANK[rtClass(rt)];
+  return r > goal.room[1] ? "echoey" : r < goal.room[0] ? "dead" : "ok";
+};
+
+function acousticPlan(room, rt60, aimRt = (RT60_TARGET.low + RT60_TARGET.high) / 2) {
   if (!room?.w || !room?.l || !numish(rt60) || rt60 <= 0) return null;
   const g = roomGeometry(room);
-  const aim = (RT60_TARGET.low + RT60_TARGET.high) / 2;
+  const aim = aimRt;
 
   const cur = absorptionFor(g.V, g.total, rt60);
   const model = cur.model;
@@ -1497,11 +1610,13 @@ function acousticPlan(room, rt60) {
  * The measured value is used only to weight the split between hotspots, and
  * when no value column is present the split is even.
  * ---------------------------------------------------------------------- */
-function allocateToSpots(spots, totalArea) {
-  const all = (spots || []).map((s, i) => ({ ...s, idx: i + 1 }));
+function allocateToSpots(spots, totalArea, eligible = (s) => s.type === "hot") {
+  const all = (spots || []).map((s, i) => ({ ...s, idx: s.idx ?? i + 1 }));
   if (!all.length || !numish(totalArea) || totalArea <= 0) return null;
 
-  const hot = all.filter((s) => s.type === "hot");
+  // Which readings take absorber: those the sound goal marked "absorb"
+  // (see zoneVerdicts). Default, with no goal, is the hotspot label.
+  const hot = all.filter(eligible);
   if (!hot.length) return null;
 
   // Field statistics are taken across every reading, so the diffusion check
@@ -1539,215 +1654,6 @@ function allocateToSpots(spots, totalArea) {
   };
 }
 
-function buildRecs(model, counts) {
-  const recs = [];
-  const rt = model.rt60;
-  const plan = acousticPlan(model.room, rt);
-  const f1 = (n) => Number(n).toFixed(1);
-  const f2 = (n) => Number(n).toFixed(2);
-
-  // Without a measured RT60 there is no Sabine input, so there is no required
-  // αw and no coverage area. Saying so is the recommendation.
-  if (!numish(rt)) {
-    recs.push({
-      icon: AlertCircle, tone: "var(--bad)", title: "Missing parameter — RT60",
-      body: "No usable reverberation time came through with the deployed scan. Sabine solves absorption from RT60 and room volume, so without it no required αw, no coverage area and no target can be computed. Re-run the sound-sensor pass and deploy the scan again.",
-    });
-  }
-
-  if (numish(rt)) {
-    if (rt > RT60_TARGET.high) {
-      recs.push({
-        icon: TrendingDown, tone: "var(--bad)", title: "Increase absorption — target αw",
-        body: plan
-          ? (plan.practical
-              ? `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Over ${f1(plan.V)} m³ the room is short ${f1(plan.dA)} m² sabins. Apply a Class ${plan.practical.cls} absorber (αw ≥ ${plan.practical.aw.toFixed(2)}, ISO 11654) over about ${f1(plan.practical.area)} m² of wall or ceiling — ${plan.practical.pct.toFixed(0)}% of the treatable surface — to land at ${f2(plan.aim)} s. Spread across every surface the requirement is only ${awText(plan.awFull)}, below the Class D floor for a rated absorber.`
-              : `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Over ${f1(plan.V)} m³ the room is short ${f1(plan.dA)} m² sabins of absorption. Apply a surface rated ${awText(plan.awFull)} across the ${f1(plan.treatable)} m² of wall and ceiling to land at ${f2(plan.aim)} s.`)
-          : `RT60 is ${f2(rt)} s, above the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Room dimensions are needed to compute a required αw.`,
-        plan, kind: "absorb",
-      });
-    } else if (rt < RT60_TARGET.low) {
-      recs.push({
-        icon: TrendingUp, tone: "var(--sim-dead)", title: "Reduce absorption — target αw",
-        body: plan
-          ? `RT60 is ${f2(rt)} s, below the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. The room is over-absorbing by ${f1(Math.abs(plan.dA))} m² sabins. Bring the treated wall and ceiling surface down to about ${awText(plan.awFull)}, or swap absorptive area for reflective/diffusive area of equivalent size.`
-          : `RT60 is ${f2(rt)} s, below the ${RT60_TARGET.low}–${RT60_TARGET.high} s target. Room dimensions are needed to compute a required αw.`,
-        plan, kind: "reflect",
-      });
-    } else {
-      recs.push({
-        icon: CheckCircle2, tone: "var(--ok)", title: "RT60 within target — hold current absorption",
-        body: plan
-          ? `RT60 is ${f2(rt)} s, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} s band. The room's average absorption coefficient is ᾱ ${plan.aBar.toFixed(2)}. Keep any new surface at or near ${awText(toAwStep(plan.aBar))} so the balance holds.`
-          : `RT60 is ${f2(rt)} s, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} s band.`,
-        plan, kind: "hold",
-      });
-    }
-  }
-
-  // The quantity above is room-wide; this is where it lands. Basis is whichever
-  // ISO class the headline recommendation already settled on.
-  const basis = plan && plan.dA > 0 ? (plan.practical || plan.coverage.find((c) => c.ok)) : null;
-  const alloc = basis ? allocateToSpots(model.spots, basis.area) : null;
-
-  if (counts.hot > 0) {
-    // Hotspot surfaces get one step more than the room needs, never below
-    // Class C (αw 0.60, "highly absorbing").
-    const localAw = plan ? Math.max(0.6, Math.min(1, toAwStep(plan.awRaw + 0.1))) : 0.80;
-    recs.push({
-      icon: Volume2, tone: "var(--bad)", title: `${counts.hot} hotspot${counts.hot > 1 ? "s" : ""} — local ${awText(localAw)}`,
-      body: alloc && basis
-        ? `Energy is building up at ${counts.hot === 1 ? "this location" : "these locations"}. Split the ${f1(basis.area)} m² of Class ${basis.cls} coverage across the bounding surfaces below rather than spreading it evenly${alloc.weighted && numish(alloc.mean) ? ` — each share is weighted by how far that reading sits above the room mean of ${f2(alloc.mean)}` : ""}. Raise the rating to ${awText(localAw)} on the two surfaces nearest the strongest reading.`
-        : `Energy is building up at ${counts.hot === 1 ? "this location" : "these locations"}. Specify a higher local rating — ${awText(localAw)} or better — on the two nearest bounding surfaces, rather than spreading the same rating evenly around the room.`,
-      alloc, basis, kind: "place",
-    });
-  }
-  if (counts.dead > 0) {
-    recs.push({
-      icon: Radio, tone: "var(--sim-dead)", title: `${counts.dead} deadspot${counts.dead > 1 ? "s" : ""} — keep local αw below 0.30`,
-      body: `Coverage drops out at ${counts.dead === 1 ? "this location" : "these locations"}. Absorption cannot restore energy that never arrived, so keep the surrounding surfaces below Class D (αw < 0.30 — Class E or not classified) to stay reflective, add diffusion, or reposition the source. These points are excluded from the coverage split above.`,
-    });
-  }
-
-  // Validity notes. Neither blocks the recommendation; both change how much
-  // weight it should carry when it is defended.
-  if (alloc && !alloc.diffuse) {
-    recs.push({
-      icon: Target, tone: "var(--warn)", title: "Field is not diffuse — placement over quantity",
-      body: `Level varies ${(alloc.cv * 100).toFixed(0)}% across the acoustic zones, past the 15% at which a room can be treated as a single diffuse field. The room-total figure still holds as a quantity, but where the panels go matters more here than how many are bought.`,
-    });
-  }
-  if (plan && plan.model === "Eyring") {
-    recs.push({
-      icon: Target, tone: "var(--warn)", title: "Eyring model applied",
-      body: `Average absorption is ᾱ ${plan.aBar.toFixed(2)}, above the 0.2 ceiling where Sabine stays accurate. Absorption was solved with Eyring (RT60 = 0.161 V / −S ln(1−ᾱ)) instead.`,
-    });
-  }
-  if (plan && plan.dA > 0) {
-    recs.push({
-      icon: Radio, tone: "var(--faint)", title: "αw excludes low frequency",
-      body: "The ISO 11654 reference curve starts at the 250 Hz octave band, and the standard states the rating is not appropriate below it. Any bass buildup or modal problem in this room can survive a product meeting these figures — check the full αp curve at 125 Hz, or add volume-based treatment. An (L) shape indicator on a product only flags extra absorption at 250 Hz, not 125 Hz.",
-    });
-  }
-
-  if (numish(rt) && !numish(model.room?.h)) {
-    recs.push({
-      icon: AlertTriangle, tone: "var(--warn)", title: "Missing parameter — room height",
-      body: "No height was deployed with the room row, so the volume behind every figure above assumes 2.60 m. A real ceiling height changes V directly, and with it the absorption deficit and every coverage area in the table.",
-    });
-  }
-
-  if (!recs.length) {
-    recs.push({ icon: CheckCircle2, tone: "var(--ok)", title: "No issues detected",
-      body: "The current scan doesn't flag any hotspots or reverberation problems." });
-  }
-  return recs;
-}
-
-/* Coverage table — the same absorption deficit met by each ISO 11654 class.
-   A higher class means less area to cover; the installer picks the trade-off. */
-function AwTable({ plan }) {
-  if (!plan || !Math.abs(plan.dA)) return null;
-  const cell = { padding: "6px 10px", textAlign: "right", whiteSpace: "nowrap" };
-  const head = { ...cell, fontWeight: 600, opacity: 0.7, borderBottom: "1px solid rgba(255,255,255,0.10)" };
-  return (
-    <div style={{ marginTop: 12, overflowX: "auto", minWidth: 0, maxWidth: "100%" }}>
-      <table style={{ borderCollapse: "collapse", fontSize: "0.86em", width: "100%", maxWidth: 820 }}>
-        <thead>
-          <tr>
-            <th style={{ ...head, textAlign: "left" }}>ISO class</th>
-            <th style={{ ...head, textAlign: "left" }}>Description</th>
-            <th style={head}>Min αw</th>
-            <th style={head}>Area required</th>
-            <th style={head}>Of wall + ceiling</th>
-            <th style={{ ...head, textAlign: "left" }}>Typical options</th>
-          </tr>
-        </thead>
-        <tbody>
-          {plan.coverage.map((c) => (
-            <tr key={c.cls} style={{ opacity: c.ok ? 1 : 0.4 }}>
-              <td style={{ ...cell, textAlign: "left" }}>Class {c.cls}</td>
-              <td style={{ ...cell, textAlign: "left" }}>{c.label}</td>
-              <td style={cell}>{c.aw.toFixed(2)}</td>
-              <td style={cell}>{c.ok ? `${c.area.toFixed(1)} m²` : "not achievable"}</td>
-              <td style={cell}>{c.ok ? `${c.pct.toFixed(0)}%` : "—"}</td>
-              <td className="aw-eg">{(ABSORBER_OPTIONS[c.cls] || []).map((o) => o.name).join(" · ")}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <div style={{ marginTop: 8, fontSize: "0.82em", opacity: 0.65, lineHeight: 1.5 }}>
-        Room volume {plan.V.toFixed(1)} m³ · treatable surface {plan.treatable.toFixed(1)} m² ·
-        current ᾱ {plan.aBar.toFixed(2)} · deficit {plan.dA >= 0 ? "+" : ""}{plan.dA.toFixed(1)} m² sabins.
-        Derived from {plan.model || "Sabine"} (RT60 = 0.161 V / A); floor excluded from treatable area.
-        Areas sized at each class's lowest αw (ISO 11654 Annex B). Typical options are indicative —
-        the class is a property of a tested product and its mounting (ISO 354), not of the material name.
-      </div>
-      {!plan.feasible && (
-        <div style={{ marginTop: 8, fontSize: "0.82em", lineHeight: 1.5, padding: "8px 10px", borderRadius: 8, background: "rgba(255,91,82,0.10)", border: "1px solid rgba(255,91,82,0.30)" }}>
-          The required coefficient exceeds αw 1.00, the top of Class A — full-surface treatment alone cannot reach the target.
-          Add absorption inside the room volume, not only on its surfaces, or relax the RT60 target.
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* Placement table — the coverage area from AwTable, shared out across the
-   measured points. This is the half Sabine can't answer. */
-function SpotAllocTable({ alloc, basis }) {
-  if (!alloc || !basis) return null;
-  const cell = { padding: "6px 10px", textAlign: "right", whiteSpace: "nowrap" };
-  const head = { ...cell, fontWeight: 600, opacity: 0.7, borderBottom: "1px solid rgba(255,255,255,0.10)" };
-  const tone = (t) => (t === "hot" ? "var(--bad)" : t === "dead" ? "var(--sim-dead)" : "var(--sim-neutral)");
-
-  // alloc.rows already contains only the rows the Classification tab labelled
-  // as hotspots, so nothing needs filtering out here.
-  const treated = alloc.rows;
-  const skipped = alloc.skipped;
-  if (!treated.length) return null;
-
-  return (
-    <div style={{ marginTop: 12, overflowX: "auto", minWidth: 0, maxWidth: "100%" }}>
-      <table style={{ borderCollapse: "collapse", fontSize: "0.86em", width: "100%", maxWidth: 620 }}>
-        <thead>
-          <tr>
-            <th style={{ ...head, textAlign: "left" }}>Point</th>
-            <th style={{ ...head, textAlign: "left" }}>Bearing</th>
-            <th style={head}>Reading</th>
-            <th style={head}>Share</th>
-            <th style={head}>Area</th>
-          </tr>
-        </thead>
-        <tbody>
-          {treated.map((r) => (
-            <tr key={r.idx}>
-              <td style={{ ...cell, textAlign: "left", color: tone(r.type) }}>
-                {SPOT_LABEL[r.type] || "Spot"} {r.idx}
-              </td>
-              <td style={{ ...cell, textAlign: "left" }}>
-                {numish(r.angle) ? `${Math.round(r.angle)}°` : `x ${r.x.toFixed(1)} · z ${r.z.toFixed(1)}`}
-              </td>
-              <td style={cell}>{numish(r.value) ? r.value.toFixed(2) : "—"}</td>
-              <td style={cell}>{(r.share * 100).toFixed(0)}%</td>
-              <td style={cell}>{r.area.toFixed(1)} m²</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <div style={{ marginTop: 8, fontSize: "0.82em", opacity: 0.65, lineHeight: 1.5 }}>
-        {basis.area.toFixed(1)} m² of Class {basis.cls} (αw ≥ {basis.aw.toFixed(2)}) split across the{" "}
-        {alloc.hotCount} point{alloc.hotCount > 1 ? "s" : ""} the Classification tab marked as
-        hotspots{alloc.weighted && numish(alloc.mean)
-          ? `, weighted by level above the room mean of ${alloc.mean.toFixed(2)} · spread ${(alloc.cv * 100).toFixed(0)}%`
-          : ", split evenly — no level column in the classification data"}.
-        {skipped > 0 && ` ${skipped} neutral or dead point${skipped > 1 ? "s" : ""} excluded.`}
-        {" "}Mount on the surface each bearing points at, measured from room centre.
-      </div>
-    </div>
-  );
-}
-
 /* ---- consumer guide ------------------------------------------------------ *
  * The recommendation, told for someone who has never heard of RT60 or αw.
  * Same numbers as the technical cards (acousticPlan / allocateToSpots), just
@@ -1757,47 +1663,7 @@ function SpotAllocTable({ alloc, basis }) {
  * under "Technical details" for the panel review.
  * ------------------------------------------------------------------------ */
 
-// Plain names for the ISO 11654 classes — what a shopper actually weighs.
-const GRADE_NAME = { A: "Best", B: "Very good", C: "Good", D: "Basic" };
 
-/* ---- absorber options per ISO 11654 class -------------------------------- *
- * Typical treatments that usually test into each Annex B class. These are
- * indicative only: the class belongs to a tested product + mounting (ISO 354
- * measurement, ISO 11654 rating), so the same curtain can be Class D pleated
- * off the wall and Class E hung flat against it. The plan sizes area by class,
- * never by material — these lists only show what a class looks like in a shop.
- * Class E is listed for the deadspot advice (surfaces that should stay
- * reflective); it is never offered as treatment.
- * ------------------------------------------------------------------------ */
-const ABSORBER_OPTIONS = {
-  A: [
-    { name: "Acoustic panels (thick)", note: "fabric-wrapped mineral or glass wool, mounted with an air gap behind" },
-    { name: "Ceiling baffles / clouds", note: "hung below the ceiling so both faces absorb" },
-    { name: "Polyester (PET) fibre panels (thick)", note: "mounted with an air gap behind" },
-  ],
-  B: [
-    { name: "Acoustic panels", note: "fabric-wrapped fibreglass" },
-    { name: "Acoustic foam (thick)", note: "wedge or pyramid profile" },
-    { name: "Acoustic ceiling tiles", note: "mineral fibre, in a suspended grid" },
-  ],
-  C: [
-    { name: "Acoustic foam", note: "standard sheets" },
-    { name: "PET felt panels", note: "mid-thickness, or thinner on an air gap" },
-    { name: "Acoustic curtains (rated)", note: "multi-layer acoustic drapes, deeply pleated" },
-  ],
-  D: [
-    { name: "Heavy curtains", note: "lined and pleated, hung away from the wall" },
-    { name: "Thin felt or foam panels", note: "fixed flat to the wall" },
-    { name: "Fabric wall coverings", note: "felt or fabric pinboard over a soft backing" },
-  ],
-  E: [
-    { name: "Light curtains", note: "thin, unlined, hung flat" },
-    { name: "Bare hard surfaces", note: "plaster, painted concrete, wood, glass" },
-  ],
-};
-const optionNames = (cls) => (ABSORBER_OPTIONS[cls] || []).map((o) => o.name.toLowerCase());
-const listText = (arr) =>
-  arr.length <= 1 ? arr.join("") : `${arr.slice(0, -1).join(", ")} or ${arr[arr.length - 1]}`;
 
 // Put an area into a size a person can picture: the side of an equal square.
 // Deliberately names no material or product; only size, grade and thickness.
@@ -1880,133 +1746,376 @@ function ThicknessGuide({ bands, room }) {
   );
 }
 
-/* The formula and sources for the thickness table, kept in Technical details. */
-function ThicknessBasis() {
+/* One-line version for the consumer guide: the thickness for the lowest sound
+   the scan measured, or the thickest that still fits the room if that is too
+   deep (same rule and numbers as ThicknessGuide). */
+function ThicknessLine({ bands, room }) {
+  const lowest = bands && bands.length ? bands[0] : null;
+  const shortWall = Math.min(room?.w || Infinity, room?.l || Infinity);
+  const fits = (f) => !Number.isFinite(shortWall) || quarterWaveMm(f) / 1000 <= shortWall * 0.25;
+  const want = lowest == null ? 1000
+    : THICKNESS_BANDS.reduce((best, r) => (r.f <= Math.max(lowest, 250) ? r.f : best), 250);
+  const pick = THICKNESS_BANDS.find((r) => r.f >= want && fits(r.f)) || THICKNESS_BANDS[THICKNESS_BANDS.length - 1];
   return (
-    <div className="rec-cell" style={{ gridColumn: "1 / -1", minWidth: 0 }}>
-      <span className="ic"><Volume2 size={16} color="var(--muted)" /></span>
-      <div style={{ minWidth: 0 }}>
-        <div className="t">Absorber thickness (quarter wavelength)</div>
-        <div className="n">
-          Minimum thickness = λ/4 = c / 4f, with c = 343 m/s. In front of a rigid wall, air particle
-          velocity is zero at the wall and peaks a quarter wavelength out, so a porous absorber must
-          reach that depth to absorb frequency f effectively. Sources: Cox &amp; D'Antonio,{" "}
-          <i>Acoustic Absorbers and Diffusers: Theory, Design and Application</i>, 3rd ed., CRC Press, 2016;
-          Kuttruff, <i>Room Acoustics</i>, 6th ed., CRC Press, 2016. Absorption grades follow
-          ISO 11654:1997, from coefficients measured per ISO 354:2003.
-        </div>
-      </div>
-    </div>
+    <><b>{cmText(quarterWaveMm(pick.f))}</b> thick{" "}
+      <span style={{ color: "var(--muted)" }}>· stops echo down to {pick.what.toLowerCase()}</span></>
   );
 }
+
 const areaText = (m2) => (m2 < 0.1 ? `${(m2 * 10000).toFixed(0)} cm²` : `${m2.toFixed(2)} m²`);
 
 
-function EchoGauge({ rt }) {
-  const max = Math.max(1, rt * 1.15, RT60_TARGET.high * 1.6);
-  const pct = (v) => `${Math.min(100, (v / max) * 100).toFixed(1)}%`;
+function EchoGauge({ rt, band = RT60_TARGET, label = null }) {
+  const max = Math.max(1, rt * 1.15, RT60_HI * 1.6);
+  const pct = (v) => `${Math.max(0, Math.min(100, (v / max) * 100)).toFixed(1)}%`;
+  const goalText = label || `${band.low}–${band.high} s`;
   return (
     <div className="rg-gauge" role="img"
-      aria-label={`Echo time ${rt.toFixed(2)} seconds; goal ${RT60_TARGET.low} to ${RT60_TARGET.high} seconds`}>
+      aria-label={`Echo time ${rt.toFixed(2)} seconds; goal ${goalText}`}>
       <div className="rg-gauge-track" style={{ background: heatGradient(0, max) }}>
-        <span className="rg-gauge-goal" style={{ "--from": pct(RT60_TARGET.low), "--to": pct(RT60_TARGET.high) }} />
+        <span className="rg-gauge-goal" style={{ "--from": pct(band.low), "--to": pct(Math.min(band.high, max)) }} />
         <span className="rg-gauge-you" style={{ "--at": pct(rt) }}>
-          <span className="rg-gauge-tag">Your room {rt.toFixed(1)} s</span>
+          <span className="rg-gauge-tag">Your room {rt.toFixed(2)} s</span>
         </span>
       </div>
       <div className="rg-gauge-scale">
         <span>Dead</span>
-        <span className="rg-gauge-goal-label" style={{ "--from": pct(RT60_TARGET.low), "--to": pct(RT60_TARGET.high) }}>
-          Goal {RT60_TARGET.low}–{RT60_TARGET.high} s
+        <span className="rg-gauge-goal-label" style={{ "--from": pct(band.low), "--to": pct(Math.min(band.high, max)) }}>
+          Goal {goalText}
         </span>
-        <span>Echoey</span>
+        <span>Live</span>
       </div>
     </div>
   );
 }
 
-function GradePicker({ options, value, onChange }) {
+/* ---- client-facing rating: NRC ----------------------------------------- *
+ * NRC (Noise Reduction Coefficient, ASTM C634; measured per ASTM C423) is the
+ * single 0–1 number printed on most acoustic product labels: the average
+ * absorption coefficient at 250, 500, 1000 and 2000 Hz, rounded to 0.05.
+ * The consumer guide sizes coverage with it the same way the ISO 11654 plan
+ * does with αw: area = ΔA / (NRC − ᾱ). NRC stands in for α as a mid-frequency
+ * average, so — like αw — it says nothing below 250 Hz; the thickness line
+ * (quarter wavelength) covers the low end.
+ * Materials are named as a FAMILY (porous absorbers), not as products: per
+ * the team's acoustics expert, porous absorbers behave alike and thickness
+ * decides what they stop. The label's NRC and the thickness are what the
+ * client checks. Curtains and carpet are left out — their absorption swings
+ * too much with weight, folds and air gap to promise a figure.
+ * ------------------------------------------------------------------------ */
+const NRC_STEPS = [0.50, 0.70, 0.90];
+const POROUS_FAMILY = ["acoustic foam", "fibreglass or mineral-wool panels", "polyester (PET) felt panels"];
+function nrcOptions(plan) {
+  if (!plan || !(plan.dA > 0)) return [];
+  return NRC_STEPS.map((nrc) => {
+    const gain = nrc - plan.aBar;
+    const area = gain > 0 ? plan.dA / gain : Infinity;
+    return { nrc, area, ok: area > 0 && area <= plan.treatable };
+  });
+}
+
+function NrcRecommendation({ plan, bands, room }) {
+  const opts = nrcOptions(plan);
+  const main = opts.find((o) => o.ok);
+  if (!main) {
+    return (
+      <p>
+        Even covering every wall and the ceiling won't be enough here. The room needs absorption placed
+        inside the space as well, not only on the walls.
+      </p>
+    );
+  }
+  const better = opts.filter((o) => o.ok && o.nrc > main.nrc);
+  const sq = (a) => relatableArea(a).replace("about the size of a ", "≈ ");
   return (
-    <div className="rg-grades" role="radiogroup" aria-label="Absorption grade">
-      {options.map((c) => (
+    <>
+      <div style={{ marginTop: 6, display: "grid", gridTemplateColumns: "auto 1fr", gap: "8px 14px", alignItems: "baseline" }}>
+        <b>Use any of these</b>
+        <span>{POROUS_FAMILY.join(", ").replace(/, ([^,]*)$/, " or $1")}</span>
+        <b>Rated</b>
+        <span><b>NRC {main.nrc.toFixed(2)}</b> or higher <span style={{ color: "var(--muted)" }}>· printed on the label</span></span>
+        <b>At least</b>
+        <span><ThicknessLine bands={bands} room={room} /></span>
+        <b>Cover</b>
+        <span>
+          about <b>{areaText(main.area)}</b> <span style={{ color: "var(--muted)" }}>({sq(main.area)})</span>
+          {better.length > 0 && (
+            <div style={{ color: "var(--muted)", marginTop: 2 }}>
+              Higher NRC, less to cover: {better.map((o) => `NRC ${o.nrc.toFixed(2)} → ${areaText(o.area)}`).join(" · ")}
+            </div>
+          )}
+        </span>
+      </div>
+      <details style={{ marginTop: 10 }}>
+        <summary style={{ cursor: "pointer", color: "var(--muted)", fontSize: "0.9em", fontWeight: 600 }}>What is NRC, and why this thickness?</summary>
+        <p className="rg-hint" style={{ marginTop: 8 }}>
+          NRC is a 0–1 rating of how much sound a material soaks up — NRC 0.70 soaks up about 70%. It is measured in a
+          lab (ASTM C423) and covers normal speech and music, not deep bass; thickness takes care of the bass.
+        </p>
+        <ThicknessGuide bands={bands} room={room} />
+      </details>
+    </>
+  );
+}
+
+function GoalPicker({ value, onChange }) {
+  return (
+    <div className="rg-grades" role="radiogroup" aria-label="Sound goal">
+      {SOUND_GOALS.map((g) => (
         <button
-          key={c.cls}
+          key={g.key}
           type="button"
           role="radio"
-          aria-checked={value === c.cls}
-          disabled={!c.ok}
-          className={`rg-grade${value === c.cls ? " on" : ""}`}
-          onClick={() => onChange(c.cls)}
+          aria-checked={value === g.key}
+          className={`rg-grade${value === g.key ? " on" : ""}`}
+          onClick={() => onChange(g.key)}
         >
-          <span className="rg-grade-name">{GRADE_NAME[c.cls]}</span>
-          <span className="rg-grade-cls">Class {c.cls}</span>
-          <span className="rg-grade-note">
-            {c.ok ? `Soaks up ${Math.round(c.aw * 100)}%+ of sound` : "Not enough on its own"}
+          <span className="rg-grade-name">{g.name}</span>
+          <span className="rg-grade-cls">
+            {g.range}
           </span>
-          <span className="rg-grade-eg">e.g. {listText(optionNames(c.cls))}</span>
+          <span className="rg-grade-note">{g.use}</span>
+          <span className="rg-grade-note">{g.blurb}</span>
         </button>
       ))}
     </div>
   );
 }
 
-/* What a chosen ISO 11654 class can be bought as — curtains, panels, foam,
-   tiles — with the mounting that gets it there. Indicative, not a spec. */
-function AbsorberOptions({ cls }) {
-  const opts = ABSORBER_OPTIONS[cls] || [];
-  if (!opts.length) return null;
+/* Balanced only: which way the client faces when listening / recording. That
+   side is kept dry, the opposite side may stay lively. */
+/* "Which wall do you face?" as a small top-down map of the room, drawn to the
+   scanned proportions. Wall letters match the N / E / S / W labels on the 3D
+   view, so the client can match them without knowing compass bearings. */
+function FacingPicker({ value, onChange, room }) {
+  const w = room?.w || 4, l = room?.l || 3;
+  const k = Math.min(200 / w, 120 / l);
+  const W = w * k, L = l * k, pad = 30;
+  const x0 = pad, y0 = pad, x1 = pad + W, y1 = pad + L, cx = pad + W / 2, cy = pad + L / 2;
+  const walls = [
+    { key: "N", seg: [x0, y0, x1, y0], lab: [cx, y0 - 10] },
+    { key: "E", seg: [x1, y0, x1, y1], lab: [x1 + 14, cy + 4] },
+    { key: "S", seg: [x0, y1, x1, y1], lab: [cx, y1 + 20] },
+    { key: "W", seg: [x0, y0, x0, y1], lab: [x0 - 14, cy + 4] },
+  ];
+  const on = walls.find((wl) => wl.key === value) || walls[0];
+  const [ax, ay] = [(on.seg[0] + on.seg[2]) / 2, (on.seg[1] + on.seg[3]) / 2];
+  const tip = [cx + (ax - cx) * 0.62, cy + (ay - cy) * 0.62];
+  const pick = (key) => (e) => { if (!e.key || e.key === "Enter" || e.key === " ") { e.preventDefault?.(); onChange(key); } };
   return (
-    <div className="rg-options">
-      <div className="rg-options-title">Options that usually reach Class {cls}</div>
-      <ul className="rg-option-list">
-        {opts.map((o) => (
-          <li key={o.name} className="rg-option">
-            <span className="rg-option-name">{o.name}</span>
-            <span className="rg-option-note">{o.note}</span>
-          </li>
-        ))}
-      </ul>
+    <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", marginTop: 6 }}>
+      <svg width={W + pad * 2} height={L + pad * 2} role="radiogroup" aria-label="Wall you face" style={{ flex: "none" }}>
+        <rect x={x0} y={y0} width={W} height={L} rx={4} fill="color-mix(in srgb, var(--ink) 4%, transparent)" stroke="var(--line)" />
+        {walls.map((wl) => {
+          const sel = wl.key === value;
+          return (
+            <g key={wl.key} role="radio" aria-checked={sel} aria-label={`${FACINGS.find((f) => f.key === wl.key).name} wall`}
+              tabIndex={0} onClick={pick(wl.key)} onKeyDown={pick(wl.key)} style={{ cursor: "pointer", outline: "none" }}>
+              <line x1={wl.seg[0]} y1={wl.seg[1]} x2={wl.seg[2]} y2={wl.seg[3]} stroke="transparent" strokeWidth={18} />
+              <line x1={wl.seg[0]} y1={wl.seg[1]} x2={wl.seg[2]} y2={wl.seg[3]}
+                stroke={sel ? "var(--orange)" : "var(--muted)"} strokeWidth={sel ? 5 : 2} strokeLinecap="round" />
+              <text x={wl.lab[0]} y={wl.lab[1]} textAnchor="middle" fontSize="12" fontWeight="700"
+                fill={sel ? "var(--orange)" : "var(--muted)"}>{wl.key}</text>
+            </g>
+          );
+        })}
+        <line x1={cx} y1={cy} x2={tip[0]} y2={tip[1]} stroke="var(--orange)" strokeWidth={2} markerEnd="url(#vibra-face-arrow)" />
+        <defs>
+          <marker id="vibra-face-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--orange)" />
+          </marker>
+        </defs>
+        <circle cx={cx} cy={cy} r={6} fill="var(--ink)" />
+      </svg>
+      <div style={{ fontSize: "0.9em", color: "var(--muted)", maxWidth: 260, lineHeight: 1.5 }}>
+        Tap the wall you face. The letters match the labels on the 3D view.
+      </div>
     </div>
   );
 }
 
-function RecommendationGuide({ model, counts }) {
+const ACTION_UI = {
+  absorb: { label: "Absorb", color: "var(--bad)", hint: "add absorption on this side" },
+  diffuse: { label: "Diffuse", color: "var(--sim-dead)", hint: "add diffusion or a reflective surface" },
+  leave: { label: "Leave", color: "var(--ok)", hint: "already right for this side" },
+};
+
+/* Zone-by-zone verdicts: every measured direction, what it reads, which side
+   of the room it belongs to, and what to do there for the chosen goal. */
+function ZoneTable({ zones, goal, alloc, facingDeg = 0 }) {
+  if (!zones.length) return null;
+  const areaBy = new Map((alloc?.rows || []).map((r) => [r.idx, r.area]));
+  const cell = { padding: "6px 10px", textAlign: "left", whiteSpace: "nowrap", verticalAlign: "middle", color: "var(--ink)" };
+  const head = { ...cell, fontWeight: 600, color: "var(--muted)", borderBottom: "1px solid rgba(255,255,255,0.10)" };
+  const showSide = goal.key === "balanced";
+  return (
+    <div style={{ marginTop: 10, overflowX: "auto", maxWidth: "100%" }}>
+      <table style={{ borderCollapse: "collapse", fontSize: "0.9em", width: "100%", maxWidth: 720 }}>
+        <thead>
+          <tr>
+            <th style={head}>Where</th>
+            {showSide && <th style={head}>Side</th>}
+            <th style={head}>Reading</th>
+            <th style={head}>Do</th>
+            {alloc && <th style={{ ...head, textAlign: "right" }}>Absorber</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {zones.map((z) => {
+            const a = ACTION_UI[z.action];
+            const rt = numish(z.value) ? Number(z.value) : null;
+            return (
+              <tr key={z.idx} style={{ borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+                <td style={cell}>{relOf(z.bearing, facingDeg)} <span style={{ color: "var(--muted)" }}>· {Math.round(z.bearing)}°</span></td>
+                {showSide && <td style={cell}>{z.zone.side === "dead" ? "Quiet side" : "Lively side"}</td>}
+                <td style={cell}>
+                  <span style={{ display: "inline-block", width: 9, height: 9, borderRadius: 3, marginRight: 7, background: rtToCss(heatRt(z)) }} />
+                  {SPOT_LABEL[z.type] || "Spot"}{rt != null ? ` · ${Number(rt.toFixed(3))} s` : ""}
+                </td>
+                <td style={cell} title={a.hint}>
+                  <span style={{
+                    padding: "2px 9px", borderRadius: 999, fontWeight: 700, fontSize: "0.92em", color: a.color,
+                    background: `color-mix(in srgb, ${a.color} 14%, transparent)`,
+                  }}>{a.label}</span>
+                </td>
+                {alloc && <td style={{ ...cell, textAlign: "right" }}>{areaBy.has(z.idx) ? `${areaBy.get(z.idx).toFixed(1)} m²` : "—"}</td>}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ---- where to make changes (plain words) -------------------------------- *
+ * The per-direction verdicts from zoneVerdicts, grouped by wall so a full
+ * 360° sweep (~90 readings) reads as a handful of plain instructions:
+ * add absorption here, add diffusion here, leave these alone. The full
+ * per-reading table stays one click away (ZoneTable).
+ * ------------------------------------------------------------------------ */
+function WhereToAct({ zones, goal, facing, alloc }) {
+  const facingDeg = (FACINGS.find((f) => f.key === facing) || FACINGS[0]).deg;
+  const shareBy = new Map((alloc?.rows || []).map((r) => [r.idx, r.share]));
+  // Group readings by the wall / corner they point at, keeping compass order.
+  const groups = [];
+  zones.forEach((z) => {
+    const wall = relOf(z.bearing, facingDeg);
+    let g = groups.find((x) => x.wall === wall);
+    if (!g) { g = { wall, sector: REL8.indexOf(wall), all: 0, absorb: [], diffuse: [], marked: 0 }; groups.push(g); }
+    g.all += 1;
+    if (z.action === "leave" && z.cls !== "neutral") g.marked += 1;
+    if (z.action === "absorb") g.absorb.push(z);
+    if (z.action === "diffuse") g.diffuse.push(z);
+  });
+  groups.sort((a, b) => a.sector - b.sector);
+
+  const intro = {
+    dry: "Goal: quiet everywhere.",
+    balanced: "Goal: quiet in front of you, lively behind you.",
+    live: "Goal: lively everywhere.",
+  }[goal.key];
+
+  const absorbAt = groups.filter((g) => g.absorb.length);
+  const diffuseAt = groups.filter((g) => g.diffuse.length);
+  const fineAt = groups.filter((g) => !g.absorb.length && !g.diffuse.length);
+  const short = (wall) => wall;
+
+  const chip = (color, text, key) => (
+    <span key={key} style={{
+      display: "inline-block", margin: "3px 6px 3px 0", padding: "3px 10px", borderRadius: 999,
+      fontSize: "0.92em", fontWeight: 600, color: "var(--ink)",
+      background: `color-mix(in srgb, ${color} 16%, transparent)`,
+      border: `1px solid color-mix(in srgb, ${color} 40%, transparent)`,
+    }}>{text}</span>
+  );
+  const row = (color, label, items, note) => (
+    <div style={{ display: "flex", gap: 12, alignItems: "baseline", marginTop: 8, flexWrap: "wrap" }}>
+      <span style={{ flex: "0 0 92px", fontWeight: 700, color }}>{label}</span>
+      <div style={{ flex: "1 1 260px", minWidth: 0 }}>
+        {items}
+        {note && <div className="rg-hint" style={{ marginTop: 2 }}>{note}</div>}
+      </div>
+    </div>
+  );
+
+  return (
+    <>
+      <p style={{ margin: "2px 0 4px" }}>{intro}</p>
+      {absorbAt.length > 0 && row("var(--bad)", "Absorb",
+        absorbAt.map((g) => {
+          const share = g.absorb.reduce((s, z) => s + (shareBy.get(z.idx) || 0), 0);
+          return chip("var(--bad)", `${short(g.wall)}${share > 0 ? ` · ${Math.round(share * 100)}%` : ""}`, g.wall);
+        }),
+        alloc ? "% = share of the step 1 area to put on that side." : "Use the absorbers from step 1 (NRC on the label).")}
+      {diffuseAt.length > 0 && row("var(--sim-dead)", "Liven up",
+        diffuseAt.map((g) => chip("var(--sim-dead)", short(g.wall), g.wall)),
+        "Keep these surfaces hard — no foam, fibreglass or felt panels. Add a diffuser if needed.")}
+      {fineAt.length > 0 && row("var(--ok)", "Leave",
+        fineAt.map((g) => chip("var(--ok)", short(g.wall), g.wall)))}
+    </>
+  );
+}
+
+function RecommendationGuide({ model, counts, goal, facing, onGoal, onFacing }) {
   const rt = model.rt60;
-  const plan = numish(rt) ? acousticPlan(model.room, rt) : null;
+  const band = goal.band;
+  const facingDeg = (FACINGS.find((f) => f.key === facing) || FACINGS[0]).deg;
+  const plan = numish(rt) ? acousticPlan(model.room, rt, goal.aim) : null;
+  const zones = zoneVerdicts(model.spots, goal, facingDeg);
+  const nAbsorb = zones.filter((z) => z.action === "absorb").length;
+  const nDiffuse = zones.filter((z) => z.action === "diffuse").length;
 
   // Default grade = the one the technical plan already settled on.
-  const options = plan ? plan.coverage.slice().reverse() : []; // A first
   const fallback = plan && plan.dA > 0 ? (plan.practical || plan.coverage.find((c) => c.ok)) : null;
-  const [pick, setPick] = useState(fallback ? fallback.cls : null);
-  const chosen = options.find((c) => c.cls === pick && c.ok) || fallback;
-  const alloc = chosen ? allocateToSpots(model.spots, chosen.area) : null;
+  const chosen = fallback; // the suggested row; wall shares below are % so they hold for any row
+  const alloc = chosen ? allocateToSpots(zones, chosen.area, (z) => z.action === "absorb") : null;
+
+  const goalStep = (
+    <div className="rg-step">
+      <span className="rg-step-num" style={{ background: "var(--violet)" }}>★</span>
+      <div className="rg-step-body">
+        <div className="rg-step-title">What is this room for?</div>
+        <p>Pick the sound you want. The advice below follows it.</p>
+        <GoalPicker value={goal.key} onChange={onGoal} />
+        {zones.length > 0 && (
+          <>
+            <p style={{ marginTop: 12 }}><b>Which wall do you face</b> when you listen or record?</p>
+            <FacingPicker value={facing} onChange={onFacing} room={model.room} />
+          </>
+        )}
+      </div>
+    </div>
+  );
 
   if (!numish(rt)) {
     return (
-      <div className="rg-verdict" data-tone="warn">
-        <div className="rg-verdict-title">We couldn't measure the echo yet</div>
-        <p className="rg-lead">
-          The scan came through without a reverberation reading, so there's nothing to judge the room by.
-          Run the sound pass on the device again and re-deploy the scan.
-        </p>
+      <div className="rg">
+        {goalStep}
+        <div className="rg-verdict" data-tone="warn">
+          <div className="rg-verdict-title">We couldn't measure the echo yet</div>
+          <p className="rg-lead">
+            The scan came through without a reverberation reading, so there's nothing to judge the room by.
+            Run the sound pass on the device again and re-deploy the scan.
+          </p>
+        </div>
       </div>
     );
   }
 
-  const state = rt > RT60_TARGET.high ? "echoey" : rt < RT60_TARGET.low ? "dead" : "ok";
-  const times = rt / ((RT60_TARGET.low + RT60_TARGET.high) / 2);
+  const state = roomState(rt, goal);
   const verdict = {
     echoey: {
-      tone: "bad", title: "Your room is too echoey",
-      lead: `Sound keeps bouncing around for ${rt.toFixed(1)} seconds before it fades. For clear voices and music it should fade in ${RT60_TARGET.low}–${RT60_TARGET.high} seconds, so this room holds on ${times >= 1.5 ? `roughly ${times.toFixed(0)}× too long` : "a little too long"}.`,
+      tone: "bad", title: `Too much echo for a ${goal.name.toLowerCase()} room`,
+      lead: `Sound keeps bouncing around for ${rt.toFixed(2)} seconds before it fades. A ${goal.name.toLowerCase()} room fades ${goal.range === `${RT60_LO}–${RT60_HI} s` ? `in ${goal.range}` : goal.range}, so this room holds on too long. We aim to bring it to ${goal.aim.toFixed(2)} s.`,
     },
     dead: {
-      tone: "cool", title: "Your room sounds too dead",
-      lead: `Sound dies away after only ${rt.toFixed(1)} seconds. The goal is ${RT60_TARGET.low}–${RT60_TARGET.high} seconds, so right now voices and music can sound flat and muffled.`,
+      tone: "cool", title: `Too dry for a ${goal.name.toLowerCase()} room`,
+      lead: `Sound dies away after only ${rt.toFixed(2)} seconds. A ${goal.name.toLowerCase()} room fades ${goal.range === `${RT60_LO}–${RT60_HI} s` ? `in ${goal.range}` : goal.range}, so right now it sounds flatter than you want. We aim to bring it to ${goal.aim.toFixed(2)} s.`,
     },
     ok: {
-      tone: "ok", title: "Your room sounds balanced",
-      lead: `Sound fades in ${rt.toFixed(1)} seconds, inside the ${RT60_TARGET.low}–${RT60_TARGET.high} second goal. No treatment is needed.`,
+      tone: "ok", title: `On target for a ${goal.name.toLowerCase()} room`,
+      lead: `Sound fades in ${rt.toFixed(2)} seconds, within the ${goal.name.toLowerCase()} goal (${goal.range}). Overall, the room doesn't need more or less absorption.`,
     },
   }[state];
 
@@ -2017,39 +2126,42 @@ function RecommendationGuide({ model, counts }) {
   });
   if (plan && plan.dA > 0) tips.push({
     icon: Volume2, title: "Low frequencies need more thickness",
-    body: "Thin absorption only stops high sounds. If deep sounds still echo, go thicker. See the table above.",
+    body: "Thin absorption only stops high sounds. If deep sounds still echo, go thicker (see step 1).",
   });
   if (!numish(model.room?.h)) tips.push({
     icon: AlertTriangle, title: "Ceiling height was guessed",
     body: "The scan didn't include the room height, so we assumed 2.6 m. Re-scan for exact amounts.",
   });
 
+  let n = 0;
   return (
     <div className="rg">
+      {goalStep}
+
       <div className="rg-verdict" data-tone={verdict.tone}>
         <div className="rg-verdict-title">{verdict.title}</div>
         <p className="rg-lead">{verdict.lead}</p>
-        <EchoGauge rt={rt} />
+        <EchoGauge rt={rt} band={band} label={goal.range} />
       </div>
 
-      {state === "ok" && (
+      {state === "ok" && nAbsorb === 0 && nDiffuse === 0 && (
         <div className="rg-step">
-          <span className="rg-step-num">1</span>
+          <span className="rg-step-num">{++n}</span>
           <div className="rg-step-body">
             <div className="rg-step-title">Keep the room as it is</div>
-            <p>If anything in the room changes, scan again to check the balance still holds.</p>
+            <p>Every measured direction already fits a {goal.name.toLowerCase()} room. If anything in the room changes, scan again.</p>
           </div>
         </div>
       )}
 
       {state === "dead" && (
         <div className="rg-step">
-          <span className="rg-step-num">1</span>
+          <span className="rg-step-num">{++n}</span>
           <div className="rg-step-body">
             <div className="rg-step-title">Bring back some reflection</div>
             <p>
               {plan
-                ? `Remove roughly ${areaText(Math.abs(plan.dA))} of absorption (${relatableArea(Math.abs(plan.dA))}), or cover the same area with a hard, reflective surface.`
+                ? `Remove roughly ${areaText(Math.abs(plan.dA))} of absorption (${relatableArea(Math.abs(plan.dA))}), or cover the same area with a hard, reflective or diffusing surface.`
                 : "Remove some absorption, or add a hard, reflective surface. Scan the room size to get an exact amount."}
             </p>
           </div>
@@ -2057,48 +2169,38 @@ function RecommendationGuide({ model, counts }) {
       )}
 
       {state === "echoey" && (
-        <>
-          <div className="rg-step">
-            <span className="rg-step-num">1</span>
-            <div className="rg-step-body">
-              <div className="rg-step-title">Add sound absorption</div>
-              {!plan ? (
-                <p>Scan the room's size so we can work out how much absorption you need.</p>
-              ) : !chosen ? (
-                <p>
-                  Even covering every wall and the ceiling won't be enough here. The room needs absorption placed
-                  inside the space as well, not only on the walls.
-                </p>
-              ) : (
-                <>
-                  <p>
-                    Pick a quality grade. The better the grade, the less material you need. The grade is printed on the
-                    product. The exact amount for each grade is under Technical details.
-                  </p>
-                  <GradePicker options={options} value={chosen.cls} onChange={setPick} />
-                  <AbsorberOptions cls={chosen.cls} />
-                </>
-              )}
-              {plan && <ThicknessGuide bands={model.bands} room={model.room} />}
-            </div>
+        <div className="rg-step">
+          <span className="rg-step-num">{++n}</span>
+          <div className="rg-step-body">
+            <div className="rg-step-title">Add sound absorption</div>
+            {!plan ? (
+              <p>Scan the room's size so we can work out how much absorption you need.</p>
+            ) : !chosen ? (
+              <p>
+                Even covering every wall and the ceiling won't be enough here. The room needs absorption placed
+                inside the space as well, not only on the walls.
+              </p>
+            ) : (
+              <>
+                <NrcRecommendation plan={plan} bands={model.bands} room={model.room} />
+              </>
+            )}
           </div>
-        </>
+        </div>
       )}
 
-      {counts.dead > 0 && state !== "ok" && (
+      {zones.length > 0 && (
         <div className="rg-step">
-          <span className="rg-step-num">2</span>
+          <span className="rg-step-num">{++n}</span>
           <div className="rg-step-body">
-            <div className="rg-step-title">Leave the quiet spots bare</div>
-            <p>
-              {counts.dead} spot{counts.dead > 1 ? "s are" : " is"} already too quiet — shown in blue in the twin.
-              Absorption there would make it worse. If they matter, move the sound source or add a surface that
-              scatters sound (diffusion) instead.
-            </p>
-            <p className="rg-hint">
-              Keep those surfaces below Class D — {listText(optionNames("E"))} are fine. Avoid heavy curtains,
-              foam or acoustic panels there.
-            </p>
+            <div className="rg-step-title">Where to make changes</div>
+            <WhereToAct zones={zones} goal={goal} facing={facing} alloc={state === "echoey" ? alloc : null} />
+            <details style={{ marginTop: 12 }}>
+              <summary style={{ cursor: "pointer", color: "var(--muted)", fontSize: "0.9em", fontWeight: 600 }}>
+                See every reading ({zones.length})
+              </summary>
+              <ZoneTable zones={zones} goal={goal} alloc={state === "echoey" ? alloc : null} facingDeg={facingDeg} />
+            </details>
           </div>
         </div>
       )}
@@ -2121,45 +2223,23 @@ function RecommendationGuide({ model, counts }) {
 }
 
 function Recommendations({ model, hasModel, counts }) {
+  // The client's sound goal and listening direction. Default: Balanced,
+  // facing north (the direction the sweep starts from).
+  const [goalKey, setGoalKey] = useState("balanced");
+  const [facing, setFacing] = useState("N");
+  const goal = goalOf(goalKey);
   return (
     <section className="rec">
       <div className="rec-head">
         <span className="ic"><Target size={16} color="var(--orange)" /></span>
-        <div><div className="t">Recommendations</div><div className="s">What your scan found and how to fix it</div></div>
+        <div><div className="t">Recommendations</div><div className="s">What your scan found, and what to change for the sound you want</div></div>
       </div>
       {!hasModel ? (
         <div className="rec-empty">Deploy a room scan to see how your room sounds and what to change.</div>
       ) : (
         <>
-          <RecommendationGuide key={model.rt60} model={model} counts={counts} />
-          <details className="rg-tech">
-            <summary>Technical details (ISO 11654 · Sabine)</summary>
-            <div className="rec-grid">
-              {buildRecs(model, counts).map((r, i) => {
-                const Icon = r.icon;
-                // A card carrying a table needs the whole row — squeezed into a
-                // third of the grid the table overflows its cell and paints over
-                // the neighbouring card.
-                const wide = (r.plan && r.kind !== "hold") || r.kind === "place";
-                return (
-                  <div
-                    key={i}
-                    className="rec-cell"
-                    style={wide ? { gridColumn: "1 / -1", minWidth: 0 } : { minWidth: 0 }}
-                  >
-                    <span className="ic"><Icon size={16} color={r.tone} /></span>
-                    <div style={{ minWidth: 0 }}>
-                      <div className="t">{r.title}</div>
-                      <div className="n">{r.body}</div>
-                      {r.plan && r.kind !== "hold" && <AwTable plan={r.plan} />}
-                      {r.kind === "place" && <SpotAllocTable alloc={r.alloc} basis={r.basis} />}
-                    </div>
-                  </div>
-                );
-              })}
-              <ThicknessBasis />
-            </div>
-          </details>
+          <RecommendationGuide key={`${model.rt60}|${goalKey}`} model={model} counts={counts}
+            goal={goal} facing={facing} onGoal={setGoalKey} onFacing={setFacing} />
         </>
       )}
     </section>
