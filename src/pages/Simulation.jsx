@@ -50,6 +50,39 @@ function makeLabel(text, { fg = "#e9eaf0", worldH = 0.34, accent = null } = {}) 
 }
 
 
+/* Compass badge for the cardinal directions — deliberately NOT a pill, so it
+   never reads as one of the dimension labels. A round disc with a big bold
+   letter and the bearing underneath. North is filled solid (the reference
+   direction the sweep is measured from); E / S / W are outlined. */
+function makeCompassBadge(letter, deg, { worldH = 0.5, accent = "#ffd166", primary = false } = {}) {
+  const D = 132, ring = 6;
+  const cv = document.createElement("canvas"); cv.width = D; cv.height = D;
+  const ctx = cv.getContext("2d");
+  const [ar, ag, ab] = hexToRgb(accent);
+  const c = D / 2;
+  ctx.beginPath(); ctx.arc(c, c, c - ring / 2, 0, Math.PI * 2);
+  ctx.fillStyle = primary ? `rgba(${ar},${ag},${ab},0.96)` : "rgba(14,16,22,0.88)";
+  ctx.fill();
+  ctx.lineWidth = ring;
+  ctx.strokeStyle = `rgba(${ar},${ag},${ab},${primary ? 1 : 0.9})`;
+  ctx.stroke();
+  const ink = primary ? "#17131f" : `rgb(${ar},${ag},${ab})`;
+  ctx.fillStyle = ink; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "800 62px system-ui, -apple-system, Segoe UI, sans-serif";
+  ctx.fillText(letter, c, c - 10);
+  ctx.font = "700 24px system-ui, -apple-system, Segoe UI, sans-serif";
+  ctx.globalAlpha = primary ? 0.8 : 0.75;
+  ctx.fillText(`${deg}°`, c, c + 34);
+  ctx.globalAlpha = 1;
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.LinearFilter;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: false }));
+  sp.scale.set(worldH, worldH, 1);
+  sp.renderOrder = 21;
+  return sp;
+}
+
+
 /* ------------------------------------------------------------------ *
  * Sound heatmap
  * ------------------------------------------------------------------
@@ -363,6 +396,44 @@ function classifyLabel(raw) {
 }
 const SPOT_LABEL = { hot: "Hotspot", dead: "Deadspot", neutral: "Neutral zone" };
 
+/* ---- room dimensions: units ---------------------------------------------
+ * The LiDAR row mixes units — width_m / length_m are metres but height_cm is
+ * centimetres. Reading 61 cm as 61 m made the room 100× too big and inflated
+ * every volume-based figure (Sabine absorption, NRC cover). Everything below
+ * the parser works in metres, so convert here, once.
+ *  1. A unit-suffixed key (height_cm, height_mm, height_m) wins and is
+ *     converted by its suffix.
+ *  2. A bare key (height) is taken as metres, unless the value is impossible
+ *     for a room in metres (> 20). Then it is read as cm (≤ 2000) or mm, and
+ *     the audit says so.
+ * ------------------------------------------------------------------------ */
+const UNIT_TO_M = { m: 1, cm: 0.01, mm: 0.001 };
+const MAX_ROOM_M = 20;
+function normalizeDims(raw) {
+  const src = raw || {};
+  const out = {};
+  const notes = [];
+  for (const key of ["width", "length", "height"]) {
+    let val = null;
+    for (const u of ["m", "cm", "mm"]) {
+      const v = src[`${key}_${u}`];
+      if (numish(v) && +v > 0) { val = +v * UNIT_TO_M[u]; break; }
+    }
+    if (val == null && numish(src[key]) && +src[key] > 0) {
+      const v = +src[key];
+      if (v > MAX_ROOM_M) {
+        const u = v <= MAX_ROOM_M * 100 ? "cm" : "mm";
+        val = v * UNIT_TO_M[u];
+        notes.push({ key, raw: v, unit: u, m: val });
+      } else {
+        val = v;
+      }
+    }
+    out[key] = val;
+  }
+  return { dims: out, notes };
+}
+
 function parseDeployment(dep) {
   if (!dep) return null;
   // A deployment record can exist while carrying nothing usable — an empty
@@ -372,7 +443,7 @@ function parseDeployment(dep) {
   const hasAnyRow = Object.values(tabsRaw).some((t) => Array.isArray(t?.rows) && t.rows.length > 0);
   if (!hasAnyRow) return null;
 
-  const dims = dep.dims || {};
+  const { dims } = normalizeDims(dep.dims);
   const pos = (v) => (numish(v) && +v > 0 ? +v : null); // zero / negative are not a room
   const room = {
     w: pos(dims.width),
@@ -440,13 +511,9 @@ function parseDeployment(dep) {
     // reading is ray-cast from room centre onto the wall it points at.
     if (c.angleI >= 0 && room.w && room.l) {
       const hx = (room.w / 2) * 0.94, hz = (room.l / 2) * 0.94;
-      // The sweep always STARTS facing north. The sensor logs its own angle
-      // (servo / stepper position), which need not be 0 at the start — so
-      // the first reading collected (first labelled row, in the order the
-      // device wrote them) is taken as north, and every other reading is
-      // measured from it: bearing = logged angle − first logged angle.
-      const firstRow = c.rows.find((r) => hasLabel(r) && numish(r[c.angleI]));
-      const angleZero = firstRow ? parseFloat(firstRow[c.angleI]) : 0;
+      // The logged angle IS the compass bearing: 0° faces north, 90° east,
+      // 180° south, 270° west. No offset is applied — a reading logged at 1°
+      // is drawn at 1°, one logged at 90° faces east.
       const out = c.rows.map((r) => {
         if (!hasLabel(r)) return null;
         const raw = parseFloat(r[c.angleI]);
@@ -454,7 +521,7 @@ function parseDeployment(dep) {
         // Compass bearing: 0° = north, increasing clockwise (90° east,
         // 180° south, 270° west) — the same frame as the N/E/S/W labels on
         // the twin, where north is -z and east is +x. Wrapped into 0–360.
-        const deg = ((((raw - angleZero) % 360) + 360) % 360);
+        const deg = (((raw % 360) + 360) % 360);
         const rad = (deg * Math.PI) / 180;
         const dx = Math.sin(rad), dz = -Math.cos(rad);
         const tx = Math.abs(dx) < 1e-6 ? Infinity : hx / Math.abs(dx);
@@ -469,7 +536,6 @@ function parseDeployment(dep) {
         out.sort((a, b) => a.angle - b.angle);
         spots = out; spotsFrom = c.name;
         spotsAreBearings = true;
-        if (angleZero !== 0) console.info(`[VIBRA] sweep started at ${angleZero}° (sensor angle) — rotated so the first reading sits at north (0°).`);
         break;
       }
     }
@@ -548,8 +614,14 @@ function auditDeployment(dep, model) {
   }
 
   /* --- room dimensions (LiDAR pass) --- */
-  const d = dep.dims || {};
+  const { dims: d, notes: unitNotes } = normalizeDims(dep.dims);
   const ok = (v) => numish(v) && +v > 0;
+  for (const n of unitNotes) {
+    warnings.push({
+      title: `Room ${n.key} read as ${n.unit === "cm" ? "centimetres" : "millimetres"}`,
+      body: `The room row gave ${n.key} = ${n.raw}, which is too large to be metres for a room, so it was read as ${n.raw} ${n.unit} = ${n.m.toFixed(2)} m. Name the column ${n.key}_${n.unit} (or ${n.key}_m) to make the unit explicit.`,
+    });
+  }
   const missDims = [];
   if (!ok(d.width)) missDims.push("width");
   if (!ok(d.length)) missDims.push("length");
@@ -619,18 +691,6 @@ function auditDeployment(dep, model) {
       body: `${list.length} row${list.length > 1 ? "s" : ""} in “${cls.name}” hold a non-numeric value for “${name}” (${rowRef(list)}). Those readings are dropped from the twin.`,
     }));
 
-    // The first reading collected is taken as north (see the bearing placement in the model parser). Say so
-    // when the sensor's own angle didn't start at 0, so the rotation is visible.
-    if (ai >= 0) {
-      const first = cls.rows.find((r) => ci >= 0 && String(r[ci] ?? "").trim() !== "" && numish(r[ai]));
-      const zero = first ? parseFloat(first[ai]) : 0;
-      if (first && Math.abs(zero) > 0.5) {
-        warnings.push({
-          title: `Sweep rotated to start at north`,
-          body: `The first reading in “${cls.name}” was logged at ${zero}° by the sensor. The sweep always starts facing north, so that reading is placed at 0° (N) and every other reading is measured clockwise from it (logged angle − ${zero}°). Make sure the sensor is pointed north before each sweep.`,
-        });
-      }
-    }
   }
 
   /* --- reverberation --- */
@@ -699,10 +759,10 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
   const [deployed, setDep] = useState(() => vibraHistory.getDeployment());
   const dep = scan ?? deployed;
   const [orbiting, setOrbiting] = useState(true);
-  // Default view: only the room shell and its raw points; everything else is opt-in.
+  // Default view: the room shell and its detected edges; everything else is opt-in.
   // The Dashboard's Room twin (twinOnly) has no layers panel, so it always shows
   // the detected hotspots and deadspots from the deployed scan.
-  const [layers, setLayers] = useState({ shell: true, edges: false, raw: true, spots: twinOnly, omni: false, device: false });
+  const [layers, setLayers] = useState({ shell: true, edges: true, raw: false, spots: twinOnly, omni: false, device: false });
   const [hover, setHover] = useState(null);
   const hrefs = { hw1: deviceUrl || DEVICE_URLS.hw1, hw2: soundDeviceUrl || DEVICE_URLS.hw2 };
   const [devices, setDevices] = useState({ hw1: { geo: null, status: "loading" }, hw2: { geo: null, status: "loading" } });
@@ -964,7 +1024,9 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
 
     // ---- cardinal directions — bigger, and set farther out from the room ----
     const cardStyle = { fg: "#fff4d6", worldH: 0.38 * k, accent: COL.card };
-    const cOff = Math.max(1.5 * k, Math.max(w, l) * 0.35);
+    // Well clear of the dimension rulers: the Width / Length pills sit on the same
+    // S / E axes, so a badge too close stacks on top of them on screen.
+    const cOff = Math.max(2.6 * k, Math.max(w, l) * 0.8);
     const cy = 0.05 * k;
     // Short amber pointer strokes on the floor tie each pill to its bearing.
     const cardMat = new THREE.LineBasicMaterial({ color: new THREE.Color(COL.card), transparent: true, opacity: 0.6 });
@@ -975,10 +1037,13 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
     cardSeg(w / 2 + cOff - cTick, 0, w / 2 + cOff + cTick * 0.2, 0);
     cardSeg(0, l / 2 + cOff - cTick, 0, l / 2 + cOff + cTick * 0.2);
     cardSeg(-w / 2 - cOff + cTick, 0, -w / 2 - cOff - cTick * 0.2, 0);
-    addLabel(makeLabel("N 0°", cardStyle), 0, cy, -l / 2 - cOff);
-    addLabel(makeLabel("E 90°", cardStyle), w / 2 + cOff, cy, 0);
-    addLabel(makeLabel("S 180°", cardStyle), 0, cy, l / 2 + cOff);
-    addLabel(makeLabel("W 270°", cardStyle), -w / 2 - cOff, cy, 0);
+    // Round compass badges (not pills) so directions never look like a measurement.
+    const badge = (L, d) => makeCompassBadge(L, d, { worldH: cardStyle.worldH * 1.9, accent: COL.card, primary: L === "N" });
+    const by = cardStyle.worldH * 1.9 * 0.5; // disc rests on the floor (radius above y = 0)
+    addLabel(badge("N", 0), 0, by, -l / 2 - cOff);
+    addLabel(badge("E", 90), w / 2 + cOff, by, 0);
+    addLabel(badge("S", 180), 0, by, l / 2 + cOff);
+    addLabel(badge("W", 270), -w / 2 - cOff, by, 0);
 
     content.add(shell); groups.shell = shell;
 
@@ -1276,7 +1341,7 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
               {SPOT_LABEL[hover.type] || "Spot"}
             </div>
             {hover.value != null && numish(hover.value) && <div className="ln">RT60 {Number(hover.value).toLocaleString(undefined, { maximumFractionDigits: 3 })} s</div>}
-            {numish(hover.angle) && <div className="ln faint">bearing {Number(hover.angle).toFixed(0)}°</div>}
+            <div className="ln">Angle {Math.round(bearingOf(hover))}° · {wallOf(bearingOf(hover))}</div>
             <div className="ln faint">x {hover.x.toFixed(2)} m · z {hover.z.toFixed(2)} m</div>
           </div>
         )}
@@ -1424,6 +1489,7 @@ export default function SimulationPage({ deviceUrl, soundDeviceUrl, twinOnly = f
             {SPOT_LABEL[hover.type] || "Spot"}
           </div>
           {hover.value != null && numish(hover.value) && <div className="ln">Level {Number(hover.value).toLocaleString(undefined, { maximumFractionDigits: 3 })}</div>}
+          <div className="ln">Angle {Math.round(bearingOf(hover))}° · {wallOf(bearingOf(hover))}</div>
           <div className="ln faint">x {hover.x.toFixed(2)} m · z {hover.z.toFixed(2)} m</div>
         </div>
       )}
@@ -1498,8 +1564,9 @@ function absorptionFor(V, S, rt60) {
  *
  *   Dry       every direction dead        room aims at 0.19 s
  *   Balanced  a mix — Live End–Dead End:  room aims at 0.30 s (band centre)
- *             the side the client faces stays dead or neutral, the side
- *             behind stays neutral or live
+ *             the north side (the direction the sweep starts from,
+ *             the "N" on the twin) stays dead or neutral, the south
+ *             side stays neutral or live
  *   Live      every direction live        room aims at 0.41 s
  * Dry and Live aim GOAL_MARGIN past the threshold: the smallest change that
  * actually moves the room into that class (exactly 0.2 s or 0.4 s is still
@@ -1514,21 +1581,20 @@ const SOUND_GOALS = [
     blurb: "Quiet everywhere." },
   { key: "balanced", name: "Balanced", range: `${RT60_LO}–${RT60_HI} s`, use: "Home studio · mixing · practice room",
     room: [1, 1], aim: (RT60_LO + RT60_HI) / 2, band: { low: RT60_LO, high: RT60_HI },
-    blurb: "Quiet in front, lively behind." },
+    blurb: "Quiet to the north, lively to the south." },
   { key: "live", name: "Live", range: `above ${RT60_HI} s`, use: "Acoustic music · rehearsal · ensemble",
     room: [2, 2], aim: RT60_HI + GOAL_MARGIN, band: { low: RT60_HI, high: Infinity },
     blurb: "Lively everywhere." },
 ];
 const goalOf = (key) => SOUND_GOALS.find((g) => g.key === key) || SOUND_GOALS[1];
-const FACINGS = [
-  { key: "N", deg: 0, name: "North" }, { key: "E", deg: 90, name: "East" },
-  { key: "S", deg: 180, name: "South" }, { key: "W", deg: 270, name: "West" },
-];
-// The same direction named from where the client sits: the wall they face is
-// "front", and compass bearings run clockwise, so +90° is on their right.
-const REL8 = ["Front wall", "Front-right corner", "Right wall", "Back-right corner",
-  "Back wall", "Back-left corner", "Left wall", "Front-left corner"];
-const relOf = (deg, facingDeg) => REL8[Math.round((((deg - facingDeg) % 360) + 360) % 360 / 45) % 8];
+// The quiet ("dead") side for the Balanced goal is fixed at north — the
+// direction the sweep starts from and the "N" on the twin — so the advice
+// always uses the same compass frame as the 3D view.
+const QUIET_SIDE_DEG = 0;
+// Walls and corners named by compass, matching the N / E / S / W labels on the twin.
+const WALL8 = ["North wall", "North-east corner", "East wall", "South-east corner",
+  "South wall", "South-west corner", "West wall", "North-west corner"];
+const wallOf = (deg) => WALL8[Math.round((((deg % 360) + 360) % 360) / 45) % 8];
 // Compass bearing of a reading: its own angle, or (X/Y scans) the direction of
 // its position from the room centre — north is −z, east is +x.
 const bearingOf = (s) => (numish(s.angle)
@@ -1537,22 +1603,22 @@ const bearingOf = (s) => (numish(s.angle)
 const angGap = (a, b) => { const d = (((a - b) % 360) + 360) % 360; return d > 180 ? 360 - d : d; };
 
 /* Which classes a reading at `bearing` may be in, for this goal (as ranks). */
-function zoneFor(goal, facingDeg, bearing) {
+function zoneFor(goal, bearing) {
   if (goal.key === "dry") return { side: "dead", ok: [0, 0] };
   if (goal.key === "live") return { side: "live", ok: [2, 2] };
-  return angGap(bearing, facingDeg) <= 90
-    ? { side: "dead", ok: [0, 1] }   // in front: dead or neutral, not live
-    : { side: "live", ok: [1, 2] };  // behind: neutral or live, not dead
+  return angGap(bearing, QUIET_SIDE_DEG) <= 90
+    ? { side: "dead", ok: [0, 1] }   // north half: dead or neutral, not live
+    : { side: "live", ok: [1, 2] };  // south half: neutral or live, not dead
 }
 
 /* One verdict per measured reading: livelier than its zone allows → absorb,
    deader than its zone allows → diffuse / reflect, otherwise leave it. The
    class comes from the RT60 value (same thresholds as the classifier), or
    from the sheet's label when a reading has no value. */
-function zoneVerdicts(spots, goal, facingDeg) {
+function zoneVerdicts(spots, goal) {
   return (spots || []).map((s, i) => {
     const bearing = bearingOf(s);
-    const zone = zoneFor(goal, facingDeg, bearing);
+    const zone = zoneFor(goal, bearing);
     const cls = numish(s.value) ? rtClass(Number(s.value)) : (s.type in ZONE_RANK ? s.type : "neutral");
     const r = ZONE_RANK[cls];
     const action = r > zone.ok[1] ? "absorb" : r < zone.ok[0] ? "diffuse" : "leave";
@@ -1882,58 +1948,6 @@ function GoalPicker({ value, onChange }) {
   );
 }
 
-/* Balanced only: which way the client faces when listening / recording. That
-   side is kept dry, the opposite side may stay lively. */
-/* "Which wall do you face?" as a small top-down map of the room, drawn to the
-   scanned proportions. Wall letters match the N / E / S / W labels on the 3D
-   view, so the client can match them without knowing compass bearings. */
-function FacingPicker({ value, onChange, room }) {
-  const w = room?.w || 4, l = room?.l || 3;
-  const k = Math.min(200 / w, 120 / l);
-  const W = w * k, L = l * k, pad = 30;
-  const x0 = pad, y0 = pad, x1 = pad + W, y1 = pad + L, cx = pad + W / 2, cy = pad + L / 2;
-  const walls = [
-    { key: "N", seg: [x0, y0, x1, y0], lab: [cx, y0 - 10] },
-    { key: "E", seg: [x1, y0, x1, y1], lab: [x1 + 14, cy + 4] },
-    { key: "S", seg: [x0, y1, x1, y1], lab: [cx, y1 + 20] },
-    { key: "W", seg: [x0, y0, x0, y1], lab: [x0 - 14, cy + 4] },
-  ];
-  const on = walls.find((wl) => wl.key === value) || walls[0];
-  const [ax, ay] = [(on.seg[0] + on.seg[2]) / 2, (on.seg[1] + on.seg[3]) / 2];
-  const tip = [cx + (ax - cx) * 0.62, cy + (ay - cy) * 0.62];
-  const pick = (key) => (e) => { if (!e.key || e.key === "Enter" || e.key === " ") { e.preventDefault?.(); onChange(key); } };
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", marginTop: 6 }}>
-      <svg width={W + pad * 2} height={L + pad * 2} role="radiogroup" aria-label="Wall you face" style={{ flex: "none" }}>
-        <rect x={x0} y={y0} width={W} height={L} rx={4} fill="color-mix(in srgb, var(--ink) 4%, transparent)" stroke="var(--line)" />
-        {walls.map((wl) => {
-          const sel = wl.key === value;
-          return (
-            <g key={wl.key} role="radio" aria-checked={sel} aria-label={`${FACINGS.find((f) => f.key === wl.key).name} wall`}
-              tabIndex={0} onClick={pick(wl.key)} onKeyDown={pick(wl.key)} style={{ cursor: "pointer", outline: "none" }}>
-              <line x1={wl.seg[0]} y1={wl.seg[1]} x2={wl.seg[2]} y2={wl.seg[3]} stroke="transparent" strokeWidth={18} />
-              <line x1={wl.seg[0]} y1={wl.seg[1]} x2={wl.seg[2]} y2={wl.seg[3]}
-                stroke={sel ? "var(--orange)" : "var(--muted)"} strokeWidth={sel ? 5 : 2} strokeLinecap="round" />
-              <text x={wl.lab[0]} y={wl.lab[1]} textAnchor="middle" fontSize="12" fontWeight="700"
-                fill={sel ? "var(--orange)" : "var(--muted)"}>{wl.key}</text>
-            </g>
-          );
-        })}
-        <line x1={cx} y1={cy} x2={tip[0]} y2={tip[1]} stroke="var(--orange)" strokeWidth={2} markerEnd="url(#vibra-face-arrow)" />
-        <defs>
-          <marker id="vibra-face-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="var(--orange)" />
-          </marker>
-        </defs>
-        <circle cx={cx} cy={cy} r={6} fill="var(--ink)" />
-      </svg>
-      <div style={{ fontSize: "0.9em", color: "var(--muted)", maxWidth: 260, lineHeight: 1.5 }}>
-        Tap the wall you face. The letters match the labels on the 3D view.
-      </div>
-    </div>
-  );
-}
-
 const ACTION_UI = {
   absorb: { label: "Absorb", color: "var(--bad)", hint: "add absorption on this side" },
   diffuse: { label: "Diffuse", color: "var(--sim-dead)", hint: "add diffusion or a reflective surface" },
@@ -1942,7 +1956,7 @@ const ACTION_UI = {
 
 /* Zone-by-zone verdicts: every measured direction, what it reads, which side
    of the room it belongs to, and what to do there for the chosen goal. */
-function ZoneTable({ zones, goal, alloc, facingDeg = 0 }) {
+function ZoneTable({ zones, goal, alloc }) {
   if (!zones.length) return null;
   const areaBy = new Map((alloc?.rows || []).map((r) => [r.idx, r.area]));
   const cell = { padding: "6px 10px", textAlign: "left", whiteSpace: "nowrap", verticalAlign: "middle", color: "var(--ink)" };
@@ -1966,7 +1980,7 @@ function ZoneTable({ zones, goal, alloc, facingDeg = 0 }) {
             const rt = numish(z.value) ? Number(z.value) : null;
             return (
               <tr key={z.idx} style={{ borderTop: "1px solid rgba(255,255,255,0.06)" }}>
-                <td style={cell}>{relOf(z.bearing, facingDeg)} <span style={{ color: "var(--muted)" }}>· {Math.round(z.bearing)}°</span></td>
+                <td style={cell}>{wallOf(z.bearing)} <span style={{ color: "var(--muted)" }}>· {Math.round(z.bearing)}°</span></td>
                 {showSide && <td style={cell}>{z.zone.side === "dead" ? "Quiet side" : "Lively side"}</td>}
                 <td style={cell}>
                   <span style={{ display: "inline-block", width: 9, height: 9, borderRadius: 3, marginRight: 7, background: rtToCss(heatRt(z)) }} />
@@ -1994,15 +2008,14 @@ function ZoneTable({ zones, goal, alloc, facingDeg = 0 }) {
  * add absorption here, add diffusion here, leave these alone. The full
  * per-reading table stays one click away (ZoneTable).
  * ------------------------------------------------------------------------ */
-function WhereToAct({ zones, goal, facing, alloc }) {
-  const facingDeg = (FACINGS.find((f) => f.key === facing) || FACINGS[0]).deg;
+function WhereToAct({ zones, goal, alloc }) {
   const shareBy = new Map((alloc?.rows || []).map((r) => [r.idx, r.share]));
   // Group readings by the wall / corner they point at, keeping compass order.
   const groups = [];
   zones.forEach((z) => {
-    const wall = relOf(z.bearing, facingDeg);
+    const wall = wallOf(z.bearing);
     let g = groups.find((x) => x.wall === wall);
-    if (!g) { g = { wall, sector: REL8.indexOf(wall), all: 0, absorb: [], diffuse: [], marked: 0 }; groups.push(g); }
+    if (!g) { g = { wall, sector: WALL8.indexOf(wall), all: 0, absorb: [], diffuse: [], marked: 0 }; groups.push(g); }
     g.all += 1;
     if (z.action === "leave" && z.cls !== "neutral") g.marked += 1;
     if (z.action === "absorb") g.absorb.push(z);
@@ -2012,7 +2025,7 @@ function WhereToAct({ zones, goal, facing, alloc }) {
 
   const intro = {
     dry: "Goal: quiet everywhere.",
-    balanced: "Goal: quiet in front of you, lively behind you.",
+    balanced: "Goal: quiet toward the north wall, lively toward the south wall. Set up so you face north (the N on the 3D view).",
     live: "Goal: lively everywhere.",
   }[goal.key];
 
@@ -2057,12 +2070,11 @@ function WhereToAct({ zones, goal, facing, alloc }) {
   );
 }
 
-function RecommendationGuide({ model, counts, goal, facing, onGoal, onFacing }) {
+function RecommendationGuide({ model, counts, goal, onGoal }) {
   const rt = model.rt60;
   const band = goal.band;
-  const facingDeg = (FACINGS.find((f) => f.key === facing) || FACINGS[0]).deg;
   const plan = numish(rt) ? acousticPlan(model.room, rt, goal.aim) : null;
-  const zones = zoneVerdicts(model.spots, goal, facingDeg);
+  const zones = zoneVerdicts(model.spots, goal);
   const nAbsorb = zones.filter((z) => z.action === "absorb").length;
   const nDiffuse = zones.filter((z) => z.action === "diffuse").length;
 
@@ -2078,12 +2090,6 @@ function RecommendationGuide({ model, counts, goal, facing, onGoal, onFacing }) 
         <div className="rg-step-title">What is this room for?</div>
         <p>Pick the sound you want. The advice below follows it.</p>
         <GoalPicker value={goal.key} onChange={onGoal} />
-        {zones.length > 0 && (
-          <>
-            <p style={{ marginTop: 12 }}><b>Which wall do you face</b> when you listen or record?</p>
-            <FacingPicker value={facing} onChange={onFacing} room={model.room} />
-          </>
-        )}
       </div>
     </div>
   );
@@ -2194,12 +2200,12 @@ function RecommendationGuide({ model, counts, goal, facing, onGoal, onFacing }) 
           <span className="rg-step-num">{++n}</span>
           <div className="rg-step-body">
             <div className="rg-step-title">Where to make changes</div>
-            <WhereToAct zones={zones} goal={goal} facing={facing} alloc={state === "echoey" ? alloc : null} />
+            <WhereToAct zones={zones} goal={goal} alloc={state === "echoey" ? alloc : null} />
             <details style={{ marginTop: 12 }}>
               <summary style={{ cursor: "pointer", color: "var(--muted)", fontSize: "0.9em", fontWeight: 600 }}>
                 See every reading ({zones.length})
               </summary>
-              <ZoneTable zones={zones} goal={goal} alloc={state === "echoey" ? alloc : null} facingDeg={facingDeg} />
+              <ZoneTable zones={zones} goal={goal} alloc={state === "echoey" ? alloc : null} />
             </details>
           </div>
         </div>
@@ -2223,10 +2229,8 @@ function RecommendationGuide({ model, counts, goal, facing, onGoal, onFacing }) 
 }
 
 function Recommendations({ model, hasModel, counts }) {
-  // The client's sound goal and listening direction. Default: Balanced,
-  // facing north (the direction the sweep starts from).
+  // The client's sound goal. Default: Balanced.
   const [goalKey, setGoalKey] = useState("balanced");
-  const [facing, setFacing] = useState("N");
   const goal = goalOf(goalKey);
   return (
     <section className="rec">
@@ -2239,7 +2243,7 @@ function Recommendations({ model, hasModel, counts }) {
       ) : (
         <>
           <RecommendationGuide key={`${model.rt60}|${goalKey}`} model={model} counts={counts}
-            goal={goal} facing={facing} onGoal={setGoalKey} onFacing={setFacing} />
+            goal={goal} onGoal={setGoalKey} />
         </>
       )}
     </section>
