@@ -2,7 +2,7 @@ import React, { useState, useRef, useMemo, useEffect } from "react";
 import {
   Table2, ChevronDown, Upload, Download, Rocket, Cloud, Check,
   Ruler, Box, AlertCircle, Clock, Save, RotateCcw, Radar, Volume2,
-  AlertTriangle, X, FileSpreadsheet, FileText,
+  AlertTriangle, X, FileSpreadsheet, FileText, FileDown,
 } from "lucide-react";
 import { vibraHistory } from "./vibraHistory";
 
@@ -10,6 +10,18 @@ const SHEET_ID = "1OaEfDYphqES4umBGZp33KFWuX1GjawaXj5HtRsFNNdc";
 const CLOUD_TABS = ["Room", "Obstacle", "Reverberation", "Classification"];
 const gvizUrl = (tab) => `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&headers=1&sheet=${encodeURIComponent(tab)}`;
 const INITIAL_SHEETS = {};
+/* Keep one table per tab name (case- and space-insensitive). If the same
+   name was loaded twice (cloud, file import, History restore, or saved
+   browser state), the most recently added copy wins. */
+function dedupeSheets(sheets) {
+  const byLabel = new Map();
+  Object.entries(sheets || {}).forEach(([id, s]) => {
+    const key = String(s?.label ?? id).trim().toLowerCase();
+    byLabel.delete(key); // re-insert so order follows the latest copy
+    byLabel.set(key, [id, s]);
+  });
+  return Object.fromEntries(byLabel.values());
+}
 export const TABLE_H = 460; // fixed height of each scan table
 
 /* ---- helpers ---- */
@@ -238,15 +250,19 @@ function splitSections(grid) {
   return tabs;
 }
 
+/* SheetJS is loaded only when a workbook is actually imported or exported. */
+async function loadXLSX() {
+  const mod = await import("xlsx");
+  return mod.SSF ? mod : mod.default; // ESM build vs CommonJS interop
+}
+
 /* Workbook: every tab becomes a grid of strings, the same shape parseCSV
    returns, so everything downstream treats .xlsx and .csv identically.
    Numbers keep full precision (not the cell's display rounding); cells
    formatted as dates are written as "m/d/yyyy h:mm:ss", the form parseTs
-   and the Google Sheet already use. SheetJS is loaded only when a
-   workbook is actually imported. */
+   and the Google Sheet already use. */
 async function workbookTabs(buf) {
-  const mod = await import("xlsx");
-  const XLSX = mod.SSF ? mod : mod.default; // ESM build vs CommonJS interop
+  const XLSX = await loadXLSX();
   const wb = XLSX.read(buf, { type: "array", cellNF: true, cellText: true });
   const cellText = (cell) => {
     if (!cell || cell.v == null || cell.t === "e" || cell.t === "z") return "";
@@ -267,6 +283,53 @@ async function workbookTabs(buf) {
     }
     return { tab, grid };
   });
+}
+
+/* ================================================================== *
+ * Data export (CSV / XLSX)
+ * ------------------------------------------------------------------
+ * Both write the scan in the SAME layout Import reads, so an export can
+ * be re-imported unchanged:
+ *   - CSV  → one file, one [Tab] section per table;
+ *   - XLSX → one workbook tab per table.
+ * Values are the sheet's own columns and rows (not the on-screen
+ * Field/Value or per-parameter shaping, which is display-only).
+ * PDF stays the printable report.
+ * ================================================================== */
+const csvCell = (v) => {
+  const s = String(v ?? "");
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const csvLine = (cells) => cells.map(csvCell).join(",");
+
+function tablesToCsv(tables) {
+  return tables
+    .map(([label, t]) => [
+      `[${label}]`,
+      csvLine(t.columns),
+      ...t.rows.map((r) => csvLine(t.columns.map((_, i) => r[i] ?? ""))),
+    ].join("\r\n"))
+    .join("\r\n\r\n");
+}
+
+/* Excel tab names: max 31 chars, none of \ / ? * [ ] :, and unique. */
+function sheetName(label, used) {
+  const base = (String(label).replace(/[\\/?*[\]:]/g, " ").trim() || "Sheet").slice(0, 31);
+  let name = base, n = 2;
+  while (used.has(name.toLowerCase())) { const sfx = ` (${n++})`; name = base.slice(0, 31 - sfx.length) + sfx; }
+  used.add(name.toLowerCase());
+  return name;
+}
+/* Numeric strings go in as real numbers so Excel can sort and chart them;
+   anything with a leading zero (e.g. a room ID "007") stays text. */
+const xlsxCell = (v) => (numish(v) && !/^-?0\d/.test(String(v).trim()) ? Number(v) : (v ?? ""));
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.style.display = "none";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /* ================================================================== *
@@ -377,14 +440,18 @@ export default function ParametersTable({ onSave } = {}) {
   if (initRef.current === null) initRef.current = vibraHistory.loadWorking() || {};
   const init = initRef.current;
 
-  const [sheets, setSheets] = useState(() =>
-    init.sheets ? Object.fromEntries(Object.entries(init.sheets).map(([k, v]) => [k, pruneEmptyCols(v)])) : INITIAL_SHEETS
+  const [sheets, setSheetsRaw] = useState(() =>
+    init.sheets ? dedupeSheets(Object.fromEntries(Object.entries(init.sheets).map(([k, v]) => [k, pruneEmptyCols(v)]))) : INITIAL_SHEETS
   );
+  // Every update goes through dedupeSheets, so a tab name can never appear twice.
+  const setSheets = (update) => setSheetsRaw((prev) => dedupeSheets(typeof update === "function" ? update(prev) : update));
   const [sessionKey, setSessionKey] = useState(init.sessionKey ?? "");
   const [physId, setPhysId] = useState(init.physId || "");
   const [acouId, setAcouId] = useState(init.acouId || "");
 
   const [importMenu, setImportMenu] = useState(false);
+  const [exportMenu, setExportMenu] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
   const [toast, setToast] = useState(null);
   const [cloudBusy, setCloudBusy] = useState(false);
   const [resetArmed, setResetArmed] = useState(false);
@@ -570,7 +637,17 @@ export default function ParametersTable({ onSave } = {}) {
         const { columns, rows } = gridToSheet(parseCSV(await res.text()));
         return { tab, columns, rows };
       }));
-      setSheets((prev) => { const next = { ...prev }; results.forEach(({ tab, columns, rows }) => { next[`cloud-${tab}`] = { label: tab, source: "cloud", columns, rows }; }); return next; });
+      setSheets((prev) => {
+        const next = { ...prev };
+        results.forEach(({ tab, columns, rows }) => {
+          /* Drop any loaded table with the same label (restored from History or
+             imported from a file) so each tab appears once, not twice. */
+          const key = tab.trim().toLowerCase();
+          Object.keys(next).forEach((k) => { if (String(next[k].label).trim().toLowerCase() === key) delete next[k]; });
+          next[`cloud-${tab}`] = { label: tab, source: "cloud", columns, rows };
+        });
+        return next;
+      });
       const total = results.reduce((n, r) => n + r.rows.length, 0);
       setToast({ kind: "ok", msg: `Loaded ${results.length} sheets (${total} rows) from Google Sheets` });
     } catch (err) {
@@ -602,6 +679,62 @@ export default function ParametersTable({ onSave } = {}) {
     if (typeof onSave === "function") onSave(saved);
     setToast({ kind: "ok", msg: `Saved room scan ${session.ts} to History` });
   };
+
+  /* ---- CSV / XLSX export -------------------------------------------- *
+   * The tables to write: the current room scan's bundle (same data Save
+   * and Deploy use) when a scan is loaded, otherwise every loaded sheet
+   * as-is. Ordered Room → Obstacle → Reverberation → Classification, then
+   * anything else, and empty tables are left out.
+   * --------------------------------------------------------------------- */
+  const exportTables = () => {
+    const tabs = session
+      ? buildBundle(session)
+      : Object.fromEntries(Object.values(sheets).map((s) => [s.label, { columns: s.columns, rows: s.rows }]));
+    const rank = (label) => { const i = CLOUD_TABS.findIndex((t) => t.toLowerCase() === String(label).toLowerCase()); return i < 0 ? CLOUD_TABS.length : i; };
+    return Object.entries(tabs)
+      .filter(([, t]) => t.columns?.length && t.rows?.length)
+      .sort(([a], [b]) => rank(a) - rank(b));
+  };
+  const exportStem = () => {
+    const stamp = String(session?.ts || new Date().toISOString()).replace(/[^\d]+/g, "-").replace(/^-|-$/g, "");
+    return `vibra-scan-${stamp}`;
+  };
+
+  const exportCsv = () => {
+    const tables = exportTables();
+    if (!tables.length) { setToast({ kind: "err", msg: "Nothing to export — import a scan first." }); return; }
+    // BOM so Excel opens it as UTF-8 (the import strips it again).
+    const blob = new Blob(["\uFEFF" + tablesToCsv(tables)], { type: "text/csv;charset=utf-8" });
+    const name = `${exportStem()}.csv`;
+    downloadBlob(blob, name);
+    setToast({ kind: "ok", msg: `Exported ${tables.length} table${tables.length === 1 ? "" : "s"} to ${name}` });
+  };
+
+  const exportXlsx = async () => {
+    const tables = exportTables();
+    if (!tables.length) { setToast({ kind: "err", msg: "Nothing to export — import a scan first." }); return; }
+    setExportBusy(true);
+    try {
+      const XLSX = await loadXLSX();
+      const wb = XLSX.utils.book_new();
+      const used = new Set();
+      tables.forEach(([label, t]) => {
+        const aoa = [t.columns, ...t.rows.map((r) => t.columns.map((_, i) => xlsxCell(r[i])))];
+        const ws = XLSX.utils.aoa_to_sheet(aoa);
+        ws["!cols"] = t.columns.map((c, i) => ({
+          wch: Math.min(40, Math.max(8, String(c ?? "").length, ...t.rows.slice(0, 200).map((r) => String(r[i] ?? "").length)) + 2),
+        }));
+        XLSX.utils.book_append_sheet(wb, ws, sheetName(label, used));
+      });
+      const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      const name = `${exportStem()}.xlsx`;
+      downloadBlob(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), name);
+      setToast({ kind: "ok", msg: `Exported ${tables.length} table${tables.length === 1 ? "" : "s"} to ${name}` });
+    } catch (err) {
+      setToast({ kind: "err", msg: `Couldn't build the Excel file — ${err.message}` });
+    } finally { setExportBusy(false); }
+  };
+
   /* ---- PDF export ----------------------------------------------------- *
    * One export for the whole page, not per table. Builds a standalone
    * document — room scan identity, spatial status, every physical tab and
@@ -708,6 +841,14 @@ ${sections.map(sectionHtml).join("")}
     };
     frame.srcdoc = html;
   };
+
+  const runExport = (kind) => {
+    setExportMenu(false);
+    if (kind === "csv") exportCsv();
+    else if (kind === "xlsx") exportXlsx();
+    else exportPdf();
+  };
+
   const loadBundle = (entry) => {
     if (!entry || !entry.tabs) return;
     const next = {};
@@ -763,9 +904,23 @@ ${sections.map(sectionHtml).join("")}
         <div className="pt-actions">
           <button className="btn btn--primary" onClick={deploy} disabled={!session}><Rocket size={15} color="#17131f" /><span>Deploy</span></button>
           <button className="btn btn--save" onClick={saveView} disabled={!session}><Save size={15} color="var(--ok)" /><span>Save</span></button>
-          <button className="btn" onClick={exportPdf} disabled={!hasSheets} title="Export the whole page as PDF">
-            <Download size={15} color="var(--muted)" /><span>Export PDF</span>
-          </button>
+
+          {/* Export — drops down from the button, same as Import. */}
+          <div className="menu-wrap">
+            <button className="btn" onClick={() => setExportMenu((v) => !v)} disabled={!hasSheets || exportBusy}
+              aria-haspopup="menu" aria-expanded={exportMenu} title="Export the current scan">
+              <Download size={15} color="var(--muted)" /><span>{exportBusy ? "Exporting…" : "Export"}</span>
+              <ChevronDown size={15} color="var(--muted)" className={`chev${exportMenu ? " open" : ""}`} />
+            </button>
+            {exportMenu && (
+              <Menu right width={230} onClose={() => setExportMenu(false)}>
+                <MenuItem onClick={() => runExport("csv")}><span className="menu-left"><FileText size={15} color="var(--orange)" /> Export CSV (.csv)</span></MenuItem>
+                <MenuItem onClick={() => runExport("xlsx")}><span className="menu-left"><FileSpreadsheet size={15} color="var(--ok)" /> Export Excel (.xlsx)</span></MenuItem>
+                <MenuItem onClick={() => runExport("pdf")}><span className="menu-left"><FileDown size={15} color="var(--bad)" /> Export PDF (.pdf)</span></MenuItem>
+              </Menu>
+            )}
+          </div>
+
           {/* Reset confirms in a small panel that drops DOWN from the button,
               so the toolbar never changes width and nothing shifts sideways. */}
           <div className="menu-wrap">

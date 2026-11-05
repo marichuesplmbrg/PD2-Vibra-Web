@@ -116,6 +116,23 @@ function makeCompassBadge(letter, deg, { worldH = 0.5, accent = "#ffd166", prima
    hard bands. A reading with no RT60 value falls back to a representative
    value for its label so it still shows in the right colour family. */
 const RT60_LO = RT60_TARGET.low, RT60_HI = RT60_TARGET.high; // classifier thresholds (s)
+
+/* Frequency of a reading, in Hz. The sheet may log an actual frequency
+   ("250", "1000 Hz") or the band group the firmware sorts readings into
+   (LOW / MID / HIGH). Each group is stood in for by one representative
+   frequency — set these to match the ranges the firmware uses. */
+const BAND_GROUP_HZ = { low: 250, mid: 1000, high: 4000 };
+function freqHz(raw) {
+  if (raw == null) return null;
+  const n = parseFloat(raw);
+  if (Number.isFinite(n) && n > 0) return n;
+  const key = String(raw).trim().toLowerCase();
+  if (key.startsWith("low")) return BAND_GROUP_HZ.low;
+  if (key.startsWith("mid")) return BAND_GROUP_HZ.mid;
+  if (key.startsWith("high")) return BAND_GROUP_HZ.high;
+  return null;
+}
+
 const HEAT_FALLBACK_RT = { hot: 0.6, dead: 0.1, neutral: 0.3 };
 const HEAT_STOPS = [
   [0.05, "#2446c8"], // deep blue — strong deadspot
@@ -490,6 +507,9 @@ function parseDeployment(dep) {
     const readType = (r) => classifyLabel(r[c.classI]);
     const readValue = (r) =>
       c.metricI >= 0 && numish(r[c.metricI]) ? parseFloat(r[c.metricI]) : null;
+    // Frequency of the reading, from the same row, if the tab logs one.
+    const freqI = colIdx(c.cols, /freq|hz|band/i);
+    const readFreq = (r) => (freqI >= 0 ? freqHz(r[freqI]) : null);
 
     // Cartesian rows first.
     if (c.xi >= 0 && c.yi >= 0) {
@@ -499,7 +519,7 @@ function parseDeployment(dep) {
         let x = parseFloat(r[c.xi]), z = parseFloat(r[c.yi]);
         if (!numish(x) || !numish(z)) return null;
         if (mm) { x /= 1000; z /= 1000; }
-        return { x, z, type: readType(r), value: readValue(r) };
+        return { x, z, type: readType(r), value: readValue(r), freq: readFreq(r) };
       }).filter(Boolean);
       if (out.length) {
         spots = out; spotsFrom = c.name;
@@ -528,7 +548,7 @@ function parseDeployment(dep) {
         const tz = Math.abs(dz) < 1e-6 ? Infinity : hz / Math.abs(dz);
         const tt = Math.min(tx, tz); // first wall the bearing meets
         if (!isFinite(tt)) return null;
-        return { x: dx * tt, z: dz * tt, type: readType(r), value: readValue(r), angle: deg, rawAngle: raw };
+        return { x: dx * tt, z: dz * tt, type: readType(r), value: readValue(r), freq: readFreq(r), angle: deg, rawAngle: raw };
       }).filter(Boolean);
       if (out.length) {
         // Readings always run from 0° (north) clockwise, whatever order
@@ -565,17 +585,34 @@ function parseDeployment(dep) {
     }
   }
 
-  // Measured frequency bands (Hz) from the Reverberation tab, if it lists them.
-  // Used only to say how thick the absorption must be; never invented.
-  let bands = [];
-  for (const [label, t] of Object.entries(tabs)) {
-    if (!/reverb/i.test(label)) continue;
-    const fi = colIdx(t.columns || [], /freq|hz|band/i);
-    if (fi < 0) continue;
-    bands = [...new Set((t.rows || []).map((r) => parseFloat(r[fi])).filter((v) => Number.isFinite(v) && v > 0))]
-      .sort((a, b) => a - b);
-    if (bands.length) break;
+  // Frequencies (Hz) of the HOTSPOT readings only — the ones with too much
+  // echo, which are the ones that get absorption. Used only to say how thick
+  // that absorption must be; never invented. Readings that are fine or too
+  // dry are left out, so a room whose echo problem sits only in the high
+  // sounds is not told to buy bass-thick panels.
+  //   1. From the classified spots (the same rows the hotspot markers use).
+  //   2. Otherwise from Reverberation-tab rows whose RT60 is above the target
+  //      range (> RT60_HI).
+  const isHot = (rt, type) => (numish(rt) ? Number(rt) > RT60_HI : type === "hot");
+  let bands = spots
+    .filter((s) => isHot(s.value, s.type))
+    .map((s) => s.freq)
+    .filter((f) => Number.isFinite(f) && f > 0);
+  if (!bands.length) {
+    for (const [label, t] of Object.entries(tabs)) {
+      if (!/reverb/i.test(label)) continue;
+      const cols = t.columns || [];
+      const fi = colIdx(cols, /freq|hz|band/i);
+      const ri = colIdx(cols, /rt60/i);
+      if (fi < 0 || ri < 0) continue;
+      bands = (t.rows || [])
+        .filter((r) => isHot(r[ri], null))
+        .map((r) => freqHz(r[fi]))
+        .filter((f) => Number.isFinite(f) && f > 0);
+      if (bands.length) break;
+    }
   }
+  bands = [...new Set(bands)].sort((a, b) => a - b);
 
   return { room, rawPoints, spots, spotsAreBearings, spotsFrom, rt60, bands, roomTs: dep.roomTs, at: dep.at };
 }
@@ -1551,42 +1588,33 @@ function absorptionFor(V, S, rt60) {
 }
 
 /* ---- sound goal -------------------------------------------------------- *
- * Hotspots and deadspots both have a place in a room; which the client wants
- * depends on what the room is for. The goals use the classifier's own
- * thresholds, nothing new:
+ * VIBRA's recommendations target one condition only: BALANCED room
+ * acoustics, the project's stated objective. The goal uses the classifier's
+ * own thresholds, nothing new:
  *     below 0.2 s      dead     (deadspot)
- *     0.2 – 0.4 s      neutral  (balanced)
+ *     0.2 – 0.4 s      neutral  (balanced)  <- target band (RT60_TARGET)
  *     above 0.4 s      live     (hotspot)
  * The CLASSIFICATION and heatmap are untouched — they describe what the room
- * IS. The goal only changes what the recommendation asks for:
- *   - the room-wide RT60 the Sabine / Eyring plan aims at, and
+ * IS. The goal sets what the recommendation asks for:
+ *   - the room-wide RT60 the Sabine / Eyring plan aims at (0.30 s, the
+ *     centre of the target band), and
  *   - a verdict for every measured direction: absorb, diffuse, or leave.
  *
- *   Dry       every direction dead        room aims at 0.19 s
- *   Balanced  a mix — Live End–Dead End:  room aims at 0.30 s (band centre)
- *             the north side (the direction the sweep starts from,
- *             the "N" on the twin) stays dead or neutral, the south
- *             side stays neutral or live
- *   Live      every direction live        room aims at 0.41 s
- * Dry and Live aim GOAL_MARGIN past the threshold: the smallest change that
- * actually moves the room into that class (exactly 0.2 s or 0.4 s is still
- * neutral, since the classes are "below 0.2" and "above 0.4").
+ * Balanced follows a Live End–Dead End layout: the north side (the direction
+ * the sweep starts from, the "N" on the twin) stays dead or neutral, the
+ * south side stays neutral or live.
+ *
+ * Dry and Live room preferences are outside the project scope and are not
+ * offered (see Scope and Delimitations).
  * ------------------------------------------------------------------------ */
 const ZONE_RANK = { dead: 0, neutral: 1, hot: 2 };
-const GOAL_MARGIN = 0.01; // s past the threshold, so the target is inside the class
 const rtClass = (rt) => (rt < RT60_LO ? "dead" : rt > RT60_HI ? "hot" : "neutral");
-const SOUND_GOALS = [
-  { key: "dry", name: "Dry", range: `below ${RT60_LO} s`, use: "Vocal booth · podcast · voice-over",
-    room: [0, 0], aim: RT60_LO - GOAL_MARGIN, band: { low: 0, high: RT60_LO },
-    blurb: "Quiet everywhere." },
-  { key: "balanced", name: "Balanced", range: `${RT60_LO}–${RT60_HI} s`, use: "Home studio · mixing · practice room",
-    room: [1, 1], aim: (RT60_LO + RT60_HI) / 2, band: { low: RT60_LO, high: RT60_HI },
-    blurb: "Quiet to the north, lively to the south." },
-  { key: "live", name: "Live", range: `above ${RT60_HI} s`, use: "Acoustic music · rehearsal · ensemble",
-    room: [2, 2], aim: RT60_HI + GOAL_MARGIN, band: { low: RT60_HI, high: Infinity },
-    blurb: "Lively everywhere." },
-];
-const goalOf = (key) => SOUND_GOALS.find((g) => g.key === key) || SOUND_GOALS[1];
+const BALANCED_GOAL = {
+  key: "balanced", name: "Balanced", range: `${RT60_LO}–${RT60_HI} s`,
+  use: "Home studio · mixing · practice room",
+  room: [1, 1], aim: (RT60_TARGET.low + RT60_TARGET.high) / 2, band: { low: RT60_LO, high: RT60_HI },
+  blurb: "Quiet to the north, lively to the south.",
+};
 // The quiet ("dead") side for the Balanced goal is fixed at north — the
 // direction the sweep starts from and the "N" on the twin — so the advice
 // always uses the same compass frame as the 3D view.
@@ -1602,10 +1630,8 @@ const bearingOf = (s) => (numish(s.angle)
   : (((Math.atan2(s.x, -s.z) * 180) / Math.PI) + 360) % 360);
 const angGap = (a, b) => { const d = (((a - b) % 360) + 360) % 360; return d > 180 ? 360 - d : d; };
 
-/* Which classes a reading at `bearing` may be in, for this goal (as ranks). */
+/* Which classes a reading at `bearing` may be in for a balanced room (as ranks). */
 function zoneFor(goal, bearing) {
-  if (goal.key === "dry") return { side: "dead", ok: [0, 0] };
-  if (goal.key === "live") return { side: "live", ok: [2, 2] };
   return angGap(bearing, QUIET_SIDE_DEG) <= 90
     ? { side: "dead", ok: [0, 1] }   // north half: dead or neutral, not live
     : { side: "live", ok: [1, 2] };  // south half: neutral or live, not dead
@@ -1766,7 +1792,7 @@ const cmText = (mm) => `${(mm / 10).toLocaleString(undefined, { maximumFractionD
 
 function ThicknessGuide({ bands, room }) {
   const lowest = bands && bands.length ? bands[0] : null;
-  // The row that covers the lowest band the scan measured (250–4000 Hz).
+  // The row that covers the deepest hotspot frequency (250–4000 Hz).
   const focus = lowest == null
     ? null
     : THICKNESS_BANDS.reduce((best, r) => (r.f <= Math.max(lowest, 250) ? r.f : best), 250);
@@ -1781,7 +1807,7 @@ function ThicknessGuide({ bands, room }) {
       <p>
         <b>How thick?</b> Thicker absorption stops lower sounds.{" "}
         {focus
-          ? <>Your scan picked up sound as low as {lowest} Hz, so use absorption at least <b>{cmText(quarterWaveMm(focus))}</b> thick.</>
+          ? <>The deepest sound with too much echo in your scan is about {lowest.toLocaleString()} Hz, so use absorption at least <b>{cmText(quarterWaveMm(focus))}</b> thick.</>
           : <>Find the lowest sound you want to reduce:</>}
       </p>
       <div style={{ overflowX: "auto", maxWidth: "100%" }}>
@@ -1812,9 +1838,11 @@ function ThicknessGuide({ bands, room }) {
   );
 }
 
-/* One-line version for the consumer guide: the thickness for the lowest sound
-   the scan measured, or the thickest that still fits the room if that is too
-   deep (same rule and numbers as ThicknessGuide). */
+/* One-line version for the consumer guide: the thickness for the deepest
+   sound with too much echo (hotspot readings only), or the thickest that
+   still fits the room if that is too deep (same rule and numbers as
+   ThicknessGuide). With no hotspot frequency available it falls back to
+   1000 Hz, the range of normal speech. */
 function ThicknessLine({ bands, room }) {
   const lowest = bands && bands.length ? bands[0] : null;
   const shortWall = Math.min(room?.w || Infinity, room?.l || Infinity);
@@ -1924,26 +1952,16 @@ function NrcRecommendation({ plan, bands, room }) {
   );
 }
 
-function GoalPicker({ value, onChange }) {
+/* Read-only card naming the single target the recommendations aim at. */
+function GoalCard({ goal }) {
   return (
-    <div className="rg-grades" role="radiogroup" aria-label="Sound goal">
-      {SOUND_GOALS.map((g) => (
-        <button
-          key={g.key}
-          type="button"
-          role="radio"
-          aria-checked={value === g.key}
-          className={`rg-grade${value === g.key ? " on" : ""}`}
-          onClick={() => onChange(g.key)}
-        >
-          <span className="rg-grade-name">{g.name}</span>
-          <span className="rg-grade-cls">
-            {g.range}
-          </span>
-          <span className="rg-grade-note">{g.use}</span>
-          <span className="rg-grade-note">{g.blurb}</span>
-        </button>
-      ))}
+    <div className="rg-grades" aria-label="Sound goal">
+      <div className="rg-grade on" style={{ cursor: "default" }}>
+        <span className="rg-grade-name">{goal.name}</span>
+        <span className="rg-grade-cls">{goal.range}</span>
+        <span className="rg-grade-note">{goal.use}</span>
+        <span className="rg-grade-note">{goal.blurb}</span>
+      </div>
     </div>
   );
 }
@@ -1961,7 +1979,7 @@ function ZoneTable({ zones, goal, alloc }) {
   const areaBy = new Map((alloc?.rows || []).map((r) => [r.idx, r.area]));
   const cell = { padding: "6px 10px", textAlign: "left", whiteSpace: "nowrap", verticalAlign: "middle", color: "var(--ink)" };
   const head = { ...cell, fontWeight: 600, color: "var(--muted)", borderBottom: "1px solid rgba(255,255,255,0.10)" };
-  const showSide = goal.key === "balanced";
+  const showSide = true; // balanced goal: every reading belongs to the quiet or lively side
   return (
     <div style={{ marginTop: 10, overflowX: "auto", maxWidth: "100%" }}>
       <table style={{ borderCollapse: "collapse", fontSize: "0.9em", width: "100%", maxWidth: 720 }}>
@@ -2023,11 +2041,7 @@ function WhereToAct({ zones, goal, alloc }) {
   });
   groups.sort((a, b) => a.sector - b.sector);
 
-  const intro = {
-    dry: "Goal: quiet everywhere.",
-    balanced: "Goal: quiet toward the north wall, lively toward the south wall. Set up so you face north (the N on the 3D view).",
-    live: "Goal: lively everywhere.",
-  }[goal.key];
+  const intro = "Goal: quiet toward the north wall, lively toward the south wall. Set up so you face north (the N on the 3D view).";
 
   const absorbAt = groups.filter((g) => g.absorb.length);
   const diffuseAt = groups.filter((g) => g.diffuse.length);
@@ -2070,7 +2084,7 @@ function WhereToAct({ zones, goal, alloc }) {
   );
 }
 
-function RecommendationGuide({ model, counts, goal, onGoal }) {
+function RecommendationGuide({ model, counts, goal }) {
   const rt = model.rt60;
   const band = goal.band;
   const plan = numish(rt) ? acousticPlan(model.room, rt, goal.aim) : null;
@@ -2087,9 +2101,9 @@ function RecommendationGuide({ model, counts, goal, onGoal }) {
     <div className="rg-step">
       <span className="rg-step-num" style={{ background: "var(--violet)" }}>★</span>
       <div className="rg-step-body">
-        <div className="rg-step-title">What is this room for?</div>
-        <p>Pick the sound you want. The advice below follows it.</p>
-        <GoalPicker value={goal.key} onChange={onGoal} />
+        <div className="rg-step-title">Target sound</div>
+        <p>VIBRA aims for balanced room acoustics. The advice below brings the room into this range.</p>
+        <GoalCard goal={goal} />
       </div>
     </div>
   );
@@ -2113,11 +2127,11 @@ function RecommendationGuide({ model, counts, goal, onGoal }) {
   const verdict = {
     echoey: {
       tone: "bad", title: `Too much echo for a ${goal.name.toLowerCase()} room`,
-      lead: `Sound keeps bouncing around for ${rt.toFixed(2)} seconds before it fades. A ${goal.name.toLowerCase()} room fades ${goal.range === `${RT60_LO}–${RT60_HI} s` ? `in ${goal.range}` : goal.range}, so this room holds on too long. We aim to bring it to ${goal.aim.toFixed(2)} s.`,
+      lead: `Sound keeps bouncing around for ${rt.toFixed(2)} seconds before it fades. A ${goal.name.toLowerCase()} room fades in ${goal.range}, so this room holds on too long. We aim to bring it to ${goal.aim.toFixed(2)} s.`,
     },
     dead: {
       tone: "cool", title: `Too dry for a ${goal.name.toLowerCase()} room`,
-      lead: `Sound dies away after only ${rt.toFixed(2)} seconds. A ${goal.name.toLowerCase()} room fades ${goal.range === `${RT60_LO}–${RT60_HI} s` ? `in ${goal.range}` : goal.range}, so right now it sounds flatter than you want. We aim to bring it to ${goal.aim.toFixed(2)} s.`,
+      lead: `Sound dies away after only ${rt.toFixed(2)} seconds. A ${goal.name.toLowerCase()} room fades in ${goal.range}, so right now it sounds flatter than it should. We aim to bring it to ${goal.aim.toFixed(2)} s.`,
     },
     ok: {
       tone: "ok", title: `On target for a ${goal.name.toLowerCase()} room`,
@@ -2229,21 +2243,20 @@ function RecommendationGuide({ model, counts, goal, onGoal }) {
 }
 
 function Recommendations({ model, hasModel, counts }) {
-  // The client's sound goal. Default: Balanced.
-  const [goalKey, setGoalKey] = useState("balanced");
-  const goal = goalOf(goalKey);
+  // Single target: balanced room acoustics (the project objective).
+  const goal = BALANCED_GOAL;
   return (
     <section className="rec">
       <div className="rec-head">
         <span className="ic"><Target size={16} color="var(--orange)" /></span>
-        <div><div className="t">Recommendations</div><div className="s">What your scan found, and what to change for the sound you want</div></div>
+        <div><div className="t">Recommendations</div><div className="s">What your scan found, and what to change for balanced room acoustics</div></div>
       </div>
       {!hasModel ? (
         <div className="rec-empty">Deploy a room scan to see how your room sounds and what to change.</div>
       ) : (
         <>
-          <RecommendationGuide key={`${model.rt60}|${goalKey}`} model={model} counts={counts}
-            goal={goal} onGoal={setGoalKey} />
+          <RecommendationGuide key={`${model.rt60}`} model={model} counts={counts}
+            goal={goal} />
         </>
       )}
     </section>
