@@ -479,7 +479,9 @@ function parseDeployment(dep) {
     if (xi >= 0 && yi >= 0 && !cols.some((c) => /class|label|type|spot|rt60|reverb/i.test(c))) {
       const mm = /mm/i.test(cols[xi]);
       rawPoints = (t.rows || [])
-        .map((r) => ({ x: parseFloat(r[xi]), z: parseFloat(r[yi]) }))
+        // Scan +Y points north, and north on the twin is -z, so negate Y —
+        // otherwise the layout renders mirrored top-to-bottom.
+        .map((r) => ({ x: parseFloat(r[xi]), z: -parseFloat(r[yi]) }))
         .filter((p) => numish(p.x) && numish(p.z))
         .map((p) => (mm ? { x: p.x / 1000, z: p.z / 1000 } : p));
       break;
